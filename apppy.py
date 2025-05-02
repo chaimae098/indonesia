@@ -4,6 +4,8 @@ import geopandas as gpd
 import folium
 from streamlit_folium import folium_static
 from datetime import datetime
+import plotly.express as px
+import os
 
 # --- CONFIG ---
 CSV_PATH = 'data/indonesia_data.csv'
@@ -63,94 +65,102 @@ def safe_display(df):
         df_copy['geometry'] = df_copy['geometry'].astype(str)
     return df_copy
 
-# 1. Load data with improved caching for performance
-@st.cache_data(ttl=3600, show_spinner=False)
-def load_data(csv_path, shapefile_path):
+# 1. Improved data loading strategy with better caching
+@st.cache_data(ttl=3600)
+def load_base_data(csv_path):
+    """Load and preprocess just the raw data"""
     try:
         # Load CSV with direct date parsing
         df = pd.read_csv(csv_path, sep=';', parse_dates=['Date'])
         df['New Cases'] = pd.to_numeric(df['New Cases'], errors='coerce')
         df = df[df['Location'] != 'Indonesia']  # drop country-wide aggregate
         
-        # Create pivot table
-        pivot = df.pivot(index='Date', columns='Location', values='New Cases').reset_index()
+        # Get unique dates in chronological order
+        dates = sorted(df['Date'].unique())
+        date_strings = [d.strftime('%m/%d/%Y') for d in dates]
         
-        # Convert dates to string format
-        date_strings = pivot['Date'].dt.strftime('%m/%d/%Y').tolist()
-        
-        # Load shapefile
-        shp = gpd.read_file(shapefile_path)
-        
-        # Process for map
-        merged_gdf = None
-        for date, date_str in zip(pivot['Date'], date_strings):
-            # Get data for this date
-            date_data = pivot.set_index('Date').loc[date].reset_index()
-            date_data.columns = ['Province', 'New_Cases']
-            
-            # Merge with shapefile
-            temp_gdf = shp.merge(date_data, left_on='NAME_1', right_on='Province', how='left')
-            temp_gdf[date_str] = temp_gdf['New_Cases']
-            
-            if merged_gdf is None:
-                merged_gdf = temp_gdf[['NAME_1', 'geometry', date_str]]
-            else:
-                merged_gdf[date_str] = temp_gdf[date_str]
-        
-        return date_strings, merged_gdf, pivot, df
+        return df, dates, date_strings
     except Exception as e:
-        st.error(f"Error loading data: {e}")
-        st.exception(e)
-        return [], None, None, None
+        st.error(f"Error loading CSV data: {e}")
+        return None, [], []
+
+@st.cache_data(ttl=3600)
+def load_shapefile(shapefile_path):
+    """Load just the shapefile separately"""
+    try:
+        return gpd.read_file(shapefile_path)
+    except Exception as e:
+        st.error(f"Error loading shapefile: {e}")
+        return None
 
 # Show loading message while data is being prepared
 with st.spinner("Loading COVID-19 data..."):
-    # Load data
-    dates, gdf, data_clean, raw_df = load_data(CSV_PATH, f"{SHAPEFILE_DIR}/IDN_Indonesia_1.shp")
+    # Load base data
+    raw_df, date_objects, dates = load_base_data(CSV_PATH)
+    # Load shapefile separately
+    shapefile = load_shapefile(f"{SHAPEFILE_DIR}/IDN_Indonesia_1.shp")
 
-if not dates or gdf is None:
+if raw_df is None or shapefile is None:
     st.error("Failed to load data. Please check your file paths and data format.")
     st.stop()
 
+# Process data for a specific date (only when needed)
+@st.cache_data(ttl=3600)
+def get_date_data(raw_df, shapefile, date_obj):
+    """Get data for a specific date - this avoids processing all dates at once"""
+    try:
+        # Filter data for this date
+        date_data = raw_df[raw_df['Date'] == date_obj].copy()
+        
+        # Create province-level data
+        province_data = date_data[['Location', 'New Cases']].rename(
+            columns={'Location': 'Province', 'New Cases': 'New_Cases'}
+        )
+        
+        # Merge with shapefile just for this date
+        merged_gdf = shapefile.merge(province_data, left_on='NAME_1', right_on='Province', how='left')
+        date_str = date_obj.strftime('%m/%d/%Y')
+        merged_gdf[date_str] = merged_gdf['New_Cases']
+        
+        return merged_gdf, date_str, province_data
+    except Exception as e:
+        st.error(f"Error processing data for date {date_obj}: {e}")
+        return None, None, None
+
 # 2. Display date selector with chronological ordering
-# Sort dates chronologically
-date_objs = [datetime.strptime(d, '%m/%d/%Y') for d in dates]
-sorted_indices = sorted(range(len(date_objs)), key=lambda k: date_objs[k])
-dates_sorted = [dates[i] for i in sorted_indices]
-min_date = dates_sorted[0]
-max_date = dates_sorted[-1]
+min_date = dates[0]
+max_date = dates[-1]
 
 # Create two columns for layout
 col1, col2 = st.columns([1, 3])
 
 with col1:
     st.subheader("Date Selection")
-    selected_date = st.select_slider(
+    selected_date_str = st.select_slider(
         "Select date:",
-        options=dates_sorted,
-        value=dates_sorted[-1]
+        options=dates,
+        value=dates[-1]
     )
+    # Convert string date back to datetime
+    selected_date_obj = datetime.strptime(selected_date_str, '%m/%d/%Y')
+    
+    # Get data just for the selected date (lazily)
+    gdf, date_str, province_data = get_date_data(raw_df, shapefile, selected_date_obj)
     
     # Calculate COVID metrics for selected date
-    if data_clean is not None:
+    if province_data is not None:
         try:
-            # Convert selected_date string to pandas datetime
-            date_obj = datetime.strptime(selected_date, '%m/%d/%Y')
-            
-            # Get data for this date
-            date_data = data_clean.set_index('Date').loc[date_obj]
-            
             # Calculate metrics
-            total_cases = int(date_data.sum())
-            max_province = date_data.idxmax()
-            max_cases = int(date_data.max())
+            total_cases = int(province_data['New_Cases'].sum())
+            max_province = province_data.loc[province_data['New_Cases'].idxmax(), 'Province']
+            max_cases = int(province_data['New_Cases'].max())
             
             # Display metrics
             st.metric("Total New Cases", f"{total_cases:,}")
             st.metric("Highest Province", max_province)
             st.metric("Cases in Highest", f"{max_cases:,}")
-        except:
-            st.warning("Could not compute metrics for the selected date.")
+        except Exception as e:
+            st.warning(f"Could not compute metrics: {e}")
     
     # Add data table toggle
     show_table = st.checkbox("Show data table", value=False)
@@ -213,43 +223,26 @@ def make_map(gdf, date):
 
 with col2:
     # Create and display map with subheader
-    st.subheader(f"Choropleth for {selected_date}")
+    st.subheader(f"Choropleth for {selected_date_str}")
     
     try:
-        if gdf is not None and selected_date in gdf.columns:
-            with st.spinner(f"Creating map for {selected_date}..."):
-                m = make_map(gdf, selected_date)
+        if gdf is not None and date_str in gdf.columns:
+            with st.spinner(f"Creating map for {selected_date_str}..."):
+                m = make_map(gdf, date_str)
                 folium_static(m, width=800, height=500)
         else:
-            st.error(f"Selected date {selected_date} not available in the data")
-            st.write("Available columns:", gdf.columns.tolist() if gdf is not None else "None")
+            st.error(f"Selected date {selected_date_str} not available in the data")
     except Exception as e:
         st.error(f"Error creating map: {e}")
         st.exception(e)
-        if gdf is not None:
-            st.write("Available columns:", gdf.columns.tolist())
-            st.write("Sample data:", safe_display(gdf.head()))
-
-# Get data for table with caching for non-map data
-@st.cache_data(ttl=3600)
-def prepare_table_data(_raw_df, date_obj):
-    """Prepare table data with safe caching"""
-    raw_df = _raw_df
-    # Filter data for selected date
-    filtered_data = raw_df[raw_df['Date'] == date_obj]
-    table_data = filtered_data[['Location', 'New Cases']].copy()
-    table_data = table_data[table_data['New Cases'].notna()].sort_values('New Cases', ascending=False)
-    return table_data
 
 # Display data table conditionally
 if show_table and raw_df is not None:
     st.subheader("Data Table")
     try:
-        # Convert selected_date string to pandas datetime
-        date_obj = datetime.strptime(selected_date, '%m/%d/%Y')
-        
-        # Get table data
-        table_data = prepare_table_data(raw_df, date_obj)
+        # Filter data for selected date
+        table_data = raw_df[raw_df['Date'] == selected_date_obj][['Location', 'New Cases']].copy()
+        table_data = table_data[table_data['New Cases'].notna()].sort_values('New Cases', ascending=False)
         
         # Display with formatting
         st.dataframe(
@@ -267,21 +260,34 @@ if show_table and raw_df is not None:
     except Exception as e:
         st.error(f"Error displaying data table: {e}")
 
-# Process trend data with safe caching
+# Process trend data more efficiently
 @st.cache_data(ttl=3600)
-def prepare_trend_data(_raw_df, provinces):
-    """Prepare trend data with safe caching"""
-    raw_df = _raw_df
+def get_trend_data(raw_df, provinces, max_points=100):
+    """Get trend data with optimized point reduction"""
     if not provinces:
         return None
-    return raw_df[raw_df['Location'].isin(provinces)]
+    
+    # Filter by provinces
+    filtered = raw_df[raw_df['Location'].isin(provinces)].copy()
+    
+    # If dataset is very large, sample points to improve performance
+    dates = filtered['Date'].nunique()
+    if dates > max_points:
+        # Get evenly distributed dates
+        all_dates = sorted(filtered['Date'].unique())
+        step = max(1, len(all_dates) // max_points)
+        keep_dates = set(all_dates[::step])
+        filtered = filtered[filtered['Date'].isin(keep_dates)]
+    
+    return filtered
 
 # Get default provinces with safe caching
 @st.cache_data(ttl=3600)
-def get_top_provinces(_df):
+def get_top_provinces(df):
     """Get top provinces with safe caching"""
-    df = _df
-    return df['Location'].value_counts().nlargest(3).index.tolist()
+    # Group by location and sum cases
+    province_totals = df.groupby('Location')['New Cases'].sum().nlargest(3)
+    return province_totals.index.tolist()
 
 # Add trend analysis section
 st.subheader("COVID-19 Trend Analysis")
@@ -297,28 +303,26 @@ if raw_df is not None:
     )
     
     if provinces:
-        # Get trend data
-        trend_data = prepare_trend_data(raw_df, provinces)
+        # Get trend data with optimization
+        trend_data = get_trend_data(raw_df, provinces)
         
-        # Convert to plotly-friendly format
-        import plotly.express as px
-        
-        fig = px.line(
-            trend_data, 
-            x='Date', 
-            y='New Cases', 
-            color='Location',
-            title="COVID-19 New Cases Trend",
-            labels={"Date": "Date", "New Cases": "New Cases", "Location": "Province"}
-        )
-        
-        fig.update_layout(
-            height=450,
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-            margin=dict(l=40, r=40, t=40, b=40)
-        )
-        
-        st.plotly_chart(fig, use_container_width=True)
+        if trend_data is not None:
+            fig = px.line(
+                trend_data, 
+                x='Date', 
+                y='New Cases', 
+                color='Location',
+                title="COVID-19 New Cases Trend",
+                labels={"Date": "Date", "New Cases": "New Cases", "Location": "Province"}
+            )
+            
+            fig.update_layout(
+                height=450,
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                margin=dict(l=40, r=40, t=40, b=40)
+            )
+            
+            st.plotly_chart(fig, use_container_width=True)
 
 # Add footer with information
 st.markdown("""
@@ -327,13 +331,22 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# Add debug section (hidden by default)
-with st.expander("Debug Information", expanded=False):
+# Add debug and performance section (hidden by default)
+with st.expander("Debug & Performance Information", expanded=False):
     st.subheader("Debug Information")
+    
     if gdf is not None:
         st.write("GeoDataFrame columns:", gdf.columns.tolist())
-        st.write("Selected date column exists:", selected_date in gdf.columns)
+        st.write("Selected date column exists:", date_str in gdf.columns)
         st.write("First few rows of GeoDataFrame:")
         st.write(safe_display(gdf.head()))
-    else:
-        st.error("GeoDataFrame is None")
+    
+    st.subheader("Performance Metrics")
+    st.write("Total number of dates in dataset:", len(dates))
+    st.write("Total number of provinces:", raw_df['Location'].nunique())
+    st.write("Total data points:", len(raw_df))
+    
+    # Cache info
+    st.write("Cache Info:")
+    for key, val in st.cache_data.get_stats().items():
+        st.write(f"- {key}: {val}")
