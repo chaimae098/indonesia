@@ -64,24 +64,24 @@ def safe_display(df):
     return df_copy
 
 # 1. Load data with improved caching for performance
-@st.cache_data(ttl=3600, max_entries=20, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def load_data(csv_path, shapefile_path):
     try:
-        # Load CSV - parse dates directly when loading
+        # Load CSV with direct date parsing
         df = pd.read_csv(csv_path, sep=';', parse_dates=['Date'])
         df['New Cases'] = pd.to_numeric(df['New Cases'], errors='coerce')
         df = df[df['Location'] != 'Indonesia']  # drop country-wide aggregate
         
-        # Create pivot table - keeping original logic
+        # Create pivot table
         pivot = df.pivot(index='Date', columns='Location', values='New Cases').reset_index()
         
         # Convert dates to string format
         date_strings = pivot['Date'].dt.strftime('%m/%d/%Y').tolist()
         
-        # Load shapefile - more efficient by specifying dtype
+        # Load shapefile
         shp = gpd.read_file(shapefile_path)
         
-        # Process for map using original logic but with minor optimizations
+        # Process for map
         merged_gdf = None
         for date, date_str in zip(pivot['Date'], date_strings):
             # Get data for this date
@@ -134,7 +134,7 @@ with col1:
     # Calculate COVID metrics for selected date
     if data_clean is not None:
         try:
-            # Convert selected_date string to datetime
+            # Convert selected_date string to pandas datetime
             date_obj = datetime.strptime(selected_date, '%m/%d/%Y')
             
             # Get data for this date
@@ -155,13 +155,9 @@ with col1:
     # Add data table toggle
     show_table = st.checkbox("Show data table", value=False)
 
-# 3. Create map with caching for better performance
-@st.cache_data(ttl=3600)
-def create_map(_gdf, date):
-    """Cache map creation to improve performance"""
-    # Use _gdf instead of gdf in parameter to prevent Streamlit hashing errors
-    gdf = _gdf
-    # Create map
+# 3. Create map function (no caching as maps can't be pickled)
+def make_map(gdf, date):
+    # Create map with improved styling
     m = folium.Map(
         location=[-2.5, 118], 
         zoom_start=5, 
@@ -169,7 +165,7 @@ def create_map(_gdf, date):
         prefer_canvas=True
     )
     
-    # Add choropleth
+    # Add choropleth with better color scheme
     choropleth = folium.Choropleth(
         geo_data=gdf.__geo_interface__,
         name="choropleth",
@@ -184,7 +180,7 @@ def create_map(_gdf, date):
         smooth_factor=0.5
     ).add_to(m)
     
-    # Add tooltips
+    # Add tooltips with better styling
     folium.GeoJson(
         gdf,
         style_function=lambda x: {'fillColor': '#ffffff', 
@@ -222,8 +218,7 @@ with col2:
     try:
         if gdf is not None and selected_date in gdf.columns:
             with st.spinner(f"Creating map for {selected_date}..."):
-                # Use cached map creation
-                m = create_map(gdf, selected_date)
+                m = make_map(gdf, selected_date)
                 folium_static(m, width=800, height=500)
         else:
             st.error(f"Selected date {selected_date} not available in the data")
@@ -235,10 +230,10 @@ with col2:
             st.write("Available columns:", gdf.columns.tolist())
             st.write("Sample data:", safe_display(gdf.head()))
 
-# Cache table data
+# Get data for table with caching for non-map data
 @st.cache_data(ttl=3600)
-def get_table_data(_raw_df, date_obj):
-    # Use _raw_df to prevent Streamlit hashing errors
+def prepare_table_data(_raw_df, date_obj):
+    """Prepare table data with safe caching"""
     raw_df = _raw_df
     # Filter data for selected date
     filtered_data = raw_df[raw_df['Date'] == date_obj]
@@ -253,8 +248,8 @@ if show_table and raw_df is not None:
         # Convert selected_date string to pandas datetime
         date_obj = datetime.strptime(selected_date, '%m/%d/%Y')
         
-        # Get cached table data
-        table_data = get_table_data(raw_df, date_obj)
+        # Get table data
+        table_data = prepare_table_data(raw_df, date_obj)
         
         # Display with formatting
         st.dataframe(
@@ -272,22 +267,27 @@ if show_table and raw_df is not None:
     except Exception as e:
         st.error(f"Error displaying data table: {e}")
 
-# Cache trend data
+# Process trend data with safe caching
 @st.cache_data(ttl=3600)
-def get_trend_data(raw_df, provinces):
+def prepare_trend_data(_raw_df, provinces):
+    """Prepare trend data with safe caching"""
+    raw_df = _raw_df
     if not provinces:
         return None
     return raw_df[raw_df['Location'].isin(provinces)]
+
+# Get default provinces with safe caching
+@st.cache_data(ttl=3600)
+def get_top_provinces(_df):
+    """Get top provinces with safe caching"""
+    df = _df
+    return df['Location'].value_counts().nlargest(3).index.tolist()
 
 # Add trend analysis section
 st.subheader("COVID-19 Trend Analysis")
 if raw_df is not None:
     # Get default provinces
-    @st.cache_data(ttl=3600)
-    def get_default_provinces(df):
-        return df['Location'].value_counts().nlargest(3).index.tolist()
-    
-    default_provinces = get_default_provinces(raw_df)
+    default_provinces = get_top_provinces(raw_df)
     
     # Create a simple trend chart for selected provinces
     provinces = st.multiselect(
@@ -297,8 +297,8 @@ if raw_df is not None:
     )
     
     if provinces:
-        # Get cached trend data
-        trend_data = get_trend_data(raw_df, provinces)
+        # Get trend data
+        trend_data = prepare_trend_data(raw_df, provinces)
         
         # Convert to plotly-friendly format
         import plotly.express as px
