@@ -1,10 +1,11 @@
-
 import streamlit as st
 import pandas as pd
 import geopandas as gpd
 import folium
 from streamlit_folium import folium_static
 from datetime import datetime
+import numpy as np
+import plotly.express as px
 
 # --- CONFIG ---
 CSV_PATH = 'data/indonesia_data.csv'
@@ -68,37 +69,63 @@ def safe_display(df):
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_data(csv_path, shapefile_path):
     try:
-        # Load CSV
-        df = pd.read_csv(csv_path, sep=';')
+        # Load CSV more efficiently
+        df = pd.read_csv(csv_path, sep=';', parse_dates=['Date'])
         df['New Cases'] = pd.to_numeric(df['New Cases'], errors='coerce')
         df = df[df['Location'] != 'Indonesia']  # drop country-wide aggregate
         
-        # Add date parsing to ensure proper chronological ordering
-        df['Date'] = pd.to_datetime(df['Date'])
+        # Optimize pivot table creation
+        locations = df['Location'].unique()
+        dates = df['Date'].unique()
         
-        # Create pivot table
-        pivot = df.pivot(index='Date', columns='Location', values='New Cases').reset_index()
+        # Create a dictionary for faster lookup
+        data_dict = {}
+        for _, row in df.iterrows():
+            data_dict[(row['Date'], row['Location'])] = row['New Cases']
         
-        # Convert dates back to string format for display
-        date_strings = pivot['Date'].dt.strftime('%m/%d/%Y').tolist()
-        
-        # Load shapefile
-        shp = gpd.read_file(shapefile_path)
-        
-        # Process for map
-        merged_gdf = None
-        for date, date_str in zip(pivot['Date'], date_strings):
-            date_data = pivot.set_index('Date').loc[date].reset_index()
-            date_data.columns = ['Province', 'New_Cases']
+        # Create pivot table using dictionary
+        pivot_data = []
+        for date in dates:
+            row_dict = {'Date': date}
+            for loc in locations:
+                key = (date, loc)
+                row_dict[loc] = data_dict.get(key, np.nan)
+            pivot_data.append(row_dict)
             
-            # Merge with shapefile for this date
-            temp_gdf = shp.merge(date_data, left_on='NAME_1', right_on='Province', how='left')
-            temp_gdf[date_str] = temp_gdf['New_Cases']
+        pivot = pd.DataFrame(pivot_data)
+        
+        # Convert dates to string format for display
+        date_strings = [d.strftime('%m/%d/%Y') for d in dates]
+        date_dict = {d: d.strftime('%m/%d/%Y') for d in dates}
+        
+        # Load shapefile - only read necessary columns for performance
+        shp = gpd.read_file(shapefile_path)[['NAME_1', 'geometry']]
+        
+        # Pre-process shapefile for faster rendering
+        # Simplify geometry to reduce complexity (adjust tolerance as needed)
+        shp['geometry'] = shp['geometry'].simplify(tolerance=0.01, preserve_topology=True)
+        
+        # Process for map - optimize by creating columns all at once
+        merged_gdf = shp.copy()
+        
+        # Create a dictionary to map province names to their index in the shapefile
+        province_to_idx = {name: i for i, name in enumerate(shp['NAME_1'])}
+        
+        # Create a date_str to date mapping
+        date_str_to_date = {date_str: date for date, date_str in zip(dates, date_strings)}
+        
+        # Prepare all date columns at once
+        for date_str in date_strings:
+            merged_gdf[date_str] = np.nan
             
-            if merged_gdf is None:
-                merged_gdf = temp_gdf[['NAME_1', 'geometry', date_str]]
-            else:
-                merged_gdf[date_str] = temp_gdf[date_str]
+        # Fill in the data - more efficient approach
+        for loc in locations:
+            if loc in province_to_idx:
+                idx = province_to_idx[loc]
+                for date_str, date in date_str_to_date.items():
+                    key = (date, loc)
+                    if key in data_dict:
+                        merged_gdf.at[idx, date_str] = data_dict[key]
         
         return date_strings, merged_gdf, pivot, df
     except Exception as e:
@@ -116,9 +143,10 @@ if not dates or gdf is None:
     st.stop()
 
 # 2. Display date selector with chronological ordering
-# Sort dates chronologically by converting to datetime first, then back to strings
+# Sort dates chronologically
 dates_dt = [datetime.strptime(d, '%m/%d/%Y') for d in dates]
-dates_sorted = [d.strftime('%m/%d/%Y') for d in sorted(dates_dt)]
+dates_sorted_indices = np.argsort(dates_dt)
+dates_sorted = [dates[i] for i in dates_sorted_indices]
 min_date = dates_sorted[0]
 max_date = dates_sorted[-1]
 
@@ -133,13 +161,15 @@ with col1:
         value=dates_sorted[-1]
     )
     
-    # Calculate COVID metrics for selected date
+    # Calculate COVID metrics for selected date - optimize calculation
     if data_clean is not None:
         try:
-            # Convert selected_date string to pandas datetime
-            date_obj = datetime.strptime(selected_date, '%m/%d/%Y')
-            date_data = data_clean.set_index('Date').loc[date_obj]
+            # More efficient metrics calculation
+            selected_date_obj = datetime.strptime(selected_date, '%m/%d/%Y')
+            date_idx = data_clean.index[data_clean['Date'] == selected_date_obj].tolist()[0]
+            date_data = data_clean.iloc[date_idx].drop('Date')
             
+            # Calculate metrics efficiently
             total_cases = int(date_data.sum())
             max_province = date_data.idxmax()
             max_cases = int(date_data.max())
@@ -154,7 +184,15 @@ with col1:
     # Add data table toggle
     show_table = st.checkbox("Show data table", value=False)
 
-# 3. Create enhanced map
+# 3. Create enhanced map - optimize map generation
+@st.cache_data(ttl=3600)
+def prepare_geojson(gdf, date):
+    """Pre-process GeoJSON data for better performance"""
+    # Create a simplified copy for the choropleth
+    gdf_simple = gdf[['NAME_1', 'geometry', date]].copy()
+    # Return necessary data structures
+    return gdf_simple.__geo_interface__
+
 def make_map(gdf, date):
     # Create map with improved styling
     m = folium.Map(
@@ -164,9 +202,12 @@ def make_map(gdf, date):
         prefer_canvas=True
     )
     
+    # Use pre-processed GeoJSON
+    geo_data = prepare_geojson(gdf, date)
+    
     # Add choropleth with better color scheme
     choropleth = folium.Choropleth(
-        geo_data=gdf.__geo_interface__,
+        geo_data=geo_data,
         name="choropleth",
         data=gdf,
         columns=['NAME_1', date],
@@ -179,9 +220,11 @@ def make_map(gdf, date):
         smooth_factor=0.5
     ).add_to(m)
     
-    # Add tooltips with better styling
+    # Add tooltips with better styling - optimize by filtering only needed columns
+    tooltip_data = gdf[['NAME_1', date, 'geometry']].copy()
+    
     folium.GeoJson(
-        gdf,
+        tooltip_data,
         style_function=lambda x: {'fillColor': '#ffffff', 
                                 'color':'#000000', 
                                 'fillOpacity': 0.1, 
@@ -229,24 +272,22 @@ with col2:
             st.write("Available columns:", gdf.columns.tolist())
             st.write("Sample data:", safe_display(gdf.head()))
 
-# Display data table conditionally
-if show_table and data_clean is not None:
+# Display data table conditionally - optimize table creation
+if show_table and raw_df is not None:
     st.subheader("Data Table")
     try:
-        # Convert selected_date string to pandas datetime
-        date_obj = datetime.strptime(selected_date, '%m/%d/%Y')
+        # More efficient table data filtering
+        selected_date_obj = datetime.strptime(selected_date, '%m/%d/%Y')
         
-        # Get data for selected date and sort
-        table_data = data_clean.set_index('Date').loc[date_obj].sort_values(ascending=False)
-        table_data = table_data.reset_index()
-        table_data.columns = ['Province', 'New Cases']
-        table_data = table_data[table_data['New Cases'].notna()]
+        # Filter directly without using loc
+        table_data = raw_df[raw_df['Date'] == selected_date_obj][['Location', 'New Cases']]
+        table_data = table_data[table_data['New Cases'].notna()].sort_values('New Cases', ascending=False)
         
         # Display with formatting
         st.dataframe(
             table_data,
             column_config={
-                "Province": st.column_config.TextColumn("Province"),
+                "Location": st.column_config.TextColumn("Province"),
                 "New Cases": st.column_config.NumberColumn(
                     "New Cases",
                     format="%d"
@@ -258,23 +299,35 @@ if show_table and data_clean is not None:
     except Exception as e:
         st.error(f"Error displaying data table: {e}")
 
-# Add trend analysis section
+# Optimize trend analysis section with caching
 st.subheader("COVID-19 Trend Analysis")
+
+# Cache the filtered trend data for better performance
+@st.cache_data(ttl=3600)
+def get_trend_data(raw_df, provinces):
+    if not provinces:
+        return None
+    return raw_df[raw_df['Location'].isin(provinces)]
+
 if raw_df is not None:
+    # Get top provinces by case count for default selection
+    @st.cache_data(ttl=3600)
+    def get_top_provinces(df, n=3):
+        return df['Location'].value_counts().nlargest(n).index.tolist()
+    
+    default_provinces = get_top_provinces(raw_df)
+    
     # Create a simple trend chart for selected provinces
     provinces = st.multiselect(
         "Select provinces to compare:",
         options=sorted(raw_df['Location'].unique()),
-        default=raw_df['Location'].value_counts().nlargest(3).index.tolist()
+        default=default_provinces
     )
     
-    if provinces:
-        # Filter data for selected provinces
-        trend_data = raw_df[raw_df['Location'].isin(provinces)]
-        
-        # Convert to plotly-friendly format
-        import plotly.express as px
-        
+    trend_data = get_trend_data(raw_df, provinces)
+    
+    if trend_data is not None and not trend_data.empty:
+        # Create plotly figure
         fig = px.line(
             trend_data, 
             x='Date', 
