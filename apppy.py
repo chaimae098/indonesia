@@ -157,8 +157,10 @@ with col1:
 
 # 3. Create map with caching for better performance
 @st.cache_data(ttl=3600)
-def create_map(gdf, date):
+def create_map(_gdf, date):
     """Cache map creation to improve performance"""
+    # Use _gdf instead of gdf in parameter to prevent Streamlit hashing errors
+    gdf = _gdf
     # Create map
     m = folium.Map(
         location=[-2.5, 118], 
@@ -235,7 +237,9 @@ with col2:
 
 # Cache table data
 @st.cache_data(ttl=3600)
-def get_table_data(raw_df, date_obj):
+def get_table_data(_raw_df, date_obj):
+    # Use _raw_df to prevent Streamlit hashing errors
+    raw_df = _raw_df
     # Filter data for selected date
     filtered_data = raw_df[raw_df['Date'] == date_obj]
     table_data = filtered_data[['Location', 'New Cases']].copy()
