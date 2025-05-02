@@ -9,7 +9,7 @@ import json
 import time
 
 # --- CONFIG ---
-CSV_PATH = 'data/indonesia_data.csv'
+CSV_PATH = 'indonesia_data.csv'
 SHAPEFILE_DIR = 'data'
 CACHE_DIR = 'cache'
 
@@ -43,10 +43,6 @@ st.markdown("""
     .stSlider [data-baseweb="slider"] {
         height: 6px;
     }
-    /* Styles date text */
-    div[data-testid="stExpander"] p {
-        font-size: 16px;
-    }
     /* Card styling for map */
     .map-container {
         background-color: white;
@@ -63,7 +59,7 @@ os.makedirs(CACHE_DIR, exist_ok=True)
 # Title
 st.title("Indonesia COVID-19 New Cases Choropleth Map")
 
-# --- SUPER FAST DATA LOADING STRATEGY ---
+# --- FAST DATA LOADING STRATEGY ---
 
 @st.cache_data(ttl=3600)
 def load_and_prepare_base_data(csv_path):
@@ -101,15 +97,16 @@ def load_and_prepare_base_data(csv_path):
                 }
         
         # Pre-compute trend data for top provinces
-        province_totals = df.groupby('Location')['New Cases'].sum().nlargest(5)
+        province_totals = df.groupby('Location')['New Cases'].sum().nlargest(10)
         top_provinces = province_totals.index.tolist()
         
         # Calculate trend data for top provinces
         trend_data = {}
         for province in top_provinces:
             province_data = df[df['Location'] == province].copy()
-            if len(province_data) > 100:  # If too many points, sample
-                province_data = province_data.iloc[::len(province_data)//100 + 1]
+            # If too many points, sample to improve performance
+            if len(province_data) > 50:
+                province_data = province_data.iloc[::len(province_data)//50 + 1]
             trend_data[province] = {
                 'dates': [d.strftime('%Y-%m-%d') for d in province_data['Date']],
                 'values': province_data['New Cases'].fillna(0).tolist()
@@ -125,7 +122,7 @@ def load_and_prepare_base_data(csv_path):
 @st.cache_data(ttl=3600)
 def prepare_geojson():
     """
-    Prepare simplified GeoJSON for mapping
+    Prepare simplified GeoJSON for mapping - using cached version when possible
     """
     # Look for pre-processed GeoJSON first (much faster than shapefile)
     geojson_path = f"{CACHE_DIR}/indonesia_simple.geojson"
@@ -203,7 +200,6 @@ if raw_df is None or geojson_data is None:
     st.stop()
 
 # Determine the right property key for provinces in GeoJSON
-# Check if we need to inspect GeoJSON structure
 if 'geojson_properties' not in st.session_state and geojson_data:
     # Inspect structure to identify available properties
     if 'features' in geojson_data and len(geojson_data['features']) > 0:
@@ -214,9 +210,8 @@ if 'geojson_properties' not in st.session_state and geojson_data:
 # Function to get data for a specific date (very fast)
 def get_date_data(raw_df, date_obj):
     """Get data for specific date with minimal processing"""
-    date_str = date_obj.strftime('%m/%d/%Y')
     date_data = raw_df[raw_df['Date'] == date_obj].copy()
-    return date_str, date_data
+    return date_data
 
 # Create two columns for layout
 col1, col2 = st.columns([1, 3])
@@ -269,7 +264,7 @@ with col1:
         st.session_state['selected_property'] = 'NAME_1'
 
 # Create map function
-def make_fast_map(geojson_data, date_data, date_str):
+def make_fast_map(geojson_data, date_data):
     """Create map with optimized processing"""
     # Create province-data dictionary for this date
     province_data = {}
@@ -282,7 +277,7 @@ def make_fast_map(geojson_data, date_data, date_str):
         location=[-2.5, 118], 
         zoom_start=5, 
         tiles="CartoDB positron",
-        prefer_canvas=True
+        prefer_canvas=True  # Use Canvas renderer for better performance
     )
     
     # Use the correct property key from session state
@@ -291,7 +286,7 @@ def make_fast_map(geojson_data, date_data, date_str):
     
     # Add choropleth
     try:
-        folium.Choropleth(
+        choropleth = folium.Choropleth(
             geo_data=geojson_data,
             name="choropleth",
             data=province_data,
@@ -300,13 +295,29 @@ def make_fast_map(geojson_data, date_data, date_str):
             fill_color='YlOrRd',
             fill_opacity=0.7,
             line_opacity=0.2,
-            legend_name=f"New COVID-19 Cases ({date_str})",
+            legend_name=f"New COVID-19 Cases",
             highlight=True,
-            smooth_factor=0.5,
+            smooth_factor=0.5,  # Smoother lines for better performance
             line_color='#ffffff',
             line_weight=0.5,
             data_dict=province_data  # Direct data dictionary is much faster
         ).add_to(m)
+        
+        # Add tooltips
+        folium.GeoJson(
+            geojson_data,
+            name='labels',
+            style_function=lambda x: {
+                'fillColor': 'transparent',
+                'color': 'transparent'
+            },
+            tooltip=folium.GeoJsonTooltip(
+                fields=[property_key],
+                aliases=['Province:'],
+                style=("background-color: white; color: #333333; font-family: arial; font-size: 12px; padding: 10px;")
+            )
+        ).add_to(m)
+        
     except Exception as e:
         st.error(f"Error creating choropleth with property '{property_key}': {e}")
         
@@ -321,23 +332,6 @@ def make_fast_map(geojson_data, date_data, date_str):
                 'weight': 0.5
             }
         ).add_to(m)
-        
-        # Add a marker with sample properties to help debug
-        if 'features' in geojson_data and len(geojson_data['features']) > 0:
-            sample_feature = geojson_data['features'][0]
-            props = sample_feature.get('properties', {})
-            
-            # Find a centroid point if geometry exists
-            if 'geometry' in sample_feature and sample_feature['geometry'].get('type') == 'Polygon':
-                coords = sample_feature['geometry']['coordinates'][0]
-                # Simple centroid calc
-                lat = sum(c[1] for c in coords) / len(coords)
-                lon = sum(c[0] for c in coords) / len(coords)
-                
-                folium.Marker(
-                    [lat, lon],
-                    popup=f"Sample Properties: {props}"
-                ).add_to(m)
     
     # Add title to map
     title_html = '''
@@ -346,14 +340,14 @@ def make_fast_map(geojson_data, date_data, date_str):
     font-size: 14px; font-weight: bold; text-align: center; 
     line-height: 30px; padding: 5px; box-shadow: 0 0 5px rgba(0,0,0,0.2)">
     COVID-19 New Cases: {}</div>
-    '''.format(date_str)
+    '''.format(selected_date_str)
     m.get_root().html.add_child(folium.Element(title_html))
     
     return m
 
 with col2:
     # Create and display map with subheader
-    st.subheader(f"Choropleth for {selected_date_str}")
+    st.subheader(f"COVID-19 Map for {selected_date_str}")
     
     # Show property key info
     if 'selected_property' in st.session_state:
@@ -364,11 +358,15 @@ with col2:
         selected_date_obj = datetime.strptime(selected_date_str, '%m/%d/%Y')
         
         # Get data for this date (fast)
-        date_str, date_data = get_date_data(raw_df, selected_date_obj)
+        date_data = get_date_data(raw_df, selected_date_obj)
         
-        with st.spinner(f"Creating map for {selected_date_str}..."):
-            m = make_fast_map(geojson_data, date_data, date_str)
-            folium_static(m, width=800, height=500)
+        # Only create map if there's data
+        if not date_data.empty:
+            with st.spinner(f"Creating map for {selected_date_str}..."):
+                m = make_fast_map(geojson_data, date_data)
+                folium_static(m, width=800, height=500)
+        else:
+            st.warning(f"No data available for {selected_date_str}")
     except Exception as e:
         st.error(f"Error creating map: {e}")
         st.exception(e)
@@ -408,7 +406,7 @@ if trend_data:
     provinces = st.multiselect(
         "Select provinces to compare:",
         options=sorted(raw_df['Location'].unique()),
-        default=top_provinces[:3]
+        default=top_provinces[:3] if top_provinces else []
     )
     
     if provinces:
@@ -417,7 +415,7 @@ if trend_data:
         
         for province in provinces:
             if province in trend_data:
-                # Use pre-computed data for top provinces
+                # Use pre-computed data for top provinces (faster)
                 dates = [datetime.strptime(d, '%Y-%m-%d') for d in trend_data[province]['dates']]
                 values = trend_data[province]['values']
                 
@@ -428,10 +426,10 @@ if trend_data:
                         'Location': province
                     })
             else:
-                # Calculate on-demand for other provinces (with sampling)
+                # Calculate on-demand for other provinces (with sampling for performance)
                 province_data = raw_df[raw_df['Location'] == province].copy()
-                if len(province_data) > 100:
-                    province_data = province_data.iloc[::len(province_data)//100 + 1]
+                if len(province_data) > 50:  # Sample data for better performance
+                    province_data = province_data.iloc[::len(province_data)//50 + 1]
                 
                 for _, row in province_data.iterrows():
                     plot_data.append({
@@ -465,6 +463,7 @@ if trend_data:
 st.markdown("""
 <div style="text-align: center; margin-top: 30px; padding: 20px; color: #666;">
     <p>Data source: Indonesia Ministry of Health • Last updated: May 2025</p>
+    <p>Created with Streamlit and Folium</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -494,13 +493,3 @@ with st.expander("Debug & Performance Information", expanded=False):
     if st.checkbox("Show raw data sample"):
         st.write("Raw data sample (first 5 rows):")
         st.dataframe(raw_df.head())
-    
-    if st.checkbox("Show pre-computed metrics"):
-        st.write("Pre-computed metrics for first 3 dates:")
-        st.json({k: date_metrics[k] for k in list(date_metrics.keys())[:3]})
-    
-    # Show GeoJSON Feature Sample
-    if st.checkbox("Show GeoJSON sample"):
-        if geojson_data and 'features' in geojson_data and len(geojson_data['features']) > 0:
-            st.write("Sample GeoJSON Feature:")
-            st.json(geojson_data['features'][0])
