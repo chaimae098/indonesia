@@ -88,17 +88,45 @@ def load_base_data(csv_path):
 def load_shapefile(shapefile_path):
     """Load just the shapefile separately"""
     try:
+        # Check if file exists first
+        if not os.path.exists(shapefile_path):
+            st.error(f"Shapefile not found at: {shapefile_path}")
+            return None
         return gpd.read_file(shapefile_path)
     except Exception as e:
         st.error(f"Error loading shapefile: {e}")
+        st.exception(e)
         return None
 
 # Show loading message while data is being prepared
 with st.spinner("Loading COVID-19 data..."):
     # Load base data
     raw_df, date_objects, dates = load_base_data(CSV_PATH)
-    # Load shapefile separately
-    shapefile = load_shapefile(f"{SHAPEFILE_DIR}/IDN_Indonesia_1.shp")
+    
+    # Display shapefile path for debugging
+    shapefile_path = f"{SHAPEFILE_DIR}/IDN_Indonesia_1.shp"
+    if not os.path.exists(shapefile_path):
+        st.error(f"Shapefile not found at: {shapefile_path}")
+        st.write("Current directory:", os.getcwd())
+        st.write("Files in data directory:", os.listdir(SHAPEFILE_DIR) if os.path.exists(SHAPEFILE_DIR) else "Data directory not found")
+    
+    # Try alternative common shapefile names if exact path is not found
+    shapefile = None
+    if not os.path.exists(shapefile_path):
+        alternatives = [
+            f"{SHAPEFILE_DIR}/IDN_adm1.shp",  # GADM format
+            f"{SHAPEFILE_DIR}/indonesia.shp",
+            f"{SHAPEFILE_DIR}/idn_adm1.shp",
+            f"{SHAPEFILE_DIR}/IDN.shp"
+        ]
+        for alt_path in alternatives:
+            if os.path.exists(alt_path):
+                st.info(f"Using alternative shapefile: {alt_path}")
+                shapefile = load_shapefile(alt_path)
+                break
+    else:
+        # Load shapefile separately
+        shapefile = load_shapefile(shapefile_path)
 
 if raw_df is None or shapefile is None:
     st.error("Failed to load data. Please check your file paths and data format.")
@@ -106,8 +134,8 @@ if raw_df is None or shapefile is None:
 
 # Process data for a specific date (only when needed)
 @st.cache_data(ttl=3600)
-def get_date_data(raw_df, shapefile, date_obj):
-    """Get data for a specific date - this avoids processing all dates at once"""
+def get_province_data(raw_df, date_obj):
+    """Get province data for a specific date"""
     try:
         # Filter data for this date
         date_data = raw_df[raw_df['Date'] == date_obj].copy()
@@ -117,9 +145,23 @@ def get_date_data(raw_df, shapefile, date_obj):
             columns={'Location': 'Province', 'New Cases': 'New_Cases'}
         )
         
-        # Merge with shapefile just for this date
+        return date_obj.strftime('%m/%d/%Y'), province_data
+    except Exception as e:
+        st.error(f"Error processing data for date {date_obj}: {e}")
+        return None, None
+
+def get_date_data(raw_df, shapefile, date_obj):
+    """Get merged geodataframe for a specific date"""
+    try:
+        # Get province data (cached)
+        date_str, province_data = get_province_data(raw_df, date_obj)
+        
+        if date_str is None or province_data is None:
+            return None, None, None
+            
+        # Merge with shapefile just for this date - this part isn't cached
+        # because geopandas DataFrames aren't hashable for st.cache_data
         merged_gdf = shapefile.merge(province_data, left_on='NAME_1', right_on='Province', how='left')
-        date_str = date_obj.strftime('%m/%d/%Y')
         merged_gdf[date_str] = merged_gdf['New_Cases']
         
         return merged_gdf, date_str, province_data
@@ -136,16 +178,29 @@ col1, col2 = st.columns([1, 3])
 
 with col1:
     st.subheader("Date Selection")
-    selected_date_str = st.select_slider(
-        "Select date:",
-        options=dates,
-        value=dates[-1]
-    )
-    # Convert string date back to datetime
-    selected_date_obj = datetime.strptime(selected_date_str, '%m/%d/%Y')
     
-    # Get data just for the selected date (lazily)
-    gdf, date_str, province_data = get_date_data(raw_df, shapefile, selected_date_obj)
+    try:
+        selected_date_str = st.select_slider(
+            "Select date:",
+            options=dates,
+            value=dates[-1]
+        )
+        # Convert string date back to datetime
+        selected_date_obj = datetime.strptime(selected_date_str, '%m/%d/%Y')
+        
+        # Get province data first (cached part)
+        date_str, province_data = get_province_data(raw_df, selected_date_obj)
+        
+        # Then get the full geodataframe (non-cached part with geometry)
+        if shapefile is not None and date_str is not None and province_data is not None:
+            gdf = shapefile.merge(province_data, left_on='NAME_1', right_on='Province', how='left')
+            gdf[date_str] = gdf['New_Cases']
+        else:
+            gdf = None
+    except Exception as e:
+        st.error(f"Error processing selected date: {e}")
+        st.exception(e)
+        date_str, province_data, gdf = None, None, None
     
     # Calculate COVID metrics for selected date
     if province_data is not None:
