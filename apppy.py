@@ -9,7 +9,7 @@ import json
 import time
 
 # --- CONFIG ---
-CSV_PATH = 'indonesia_data.csv'
+CSV_PATH = 'data/indonesia_data.csv'  # Updated path to match first code example
 SHAPEFILE_DIR = 'data'
 CACHE_DIR = 'cache'
 
@@ -53,8 +53,10 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# Create cache directory if it doesn't exist
+# Ensure directories exist
 os.makedirs(CACHE_DIR, exist_ok=True)
+# If data directory doesn't exist, create it
+os.makedirs(SHAPEFILE_DIR, exist_ok=True)
 
 # Title
 st.title("Indonesia COVID-19 New Cases Choropleth Map")
@@ -124,6 +126,9 @@ def prepare_geojson():
     """
     Prepare simplified GeoJSON for mapping - using cached version when possible
     """
+    # Create cache directory if it doesn't exist
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    
     # Look for pre-processed GeoJSON first (much faster than shapefile)
     geojson_path = f"{CACHE_DIR}/indonesia_simple.geojson"
     
@@ -192,11 +197,83 @@ def prepare_geojson():
 
 # Load data with a spinner
 with st.spinner("Loading COVID-19 data..."):
+    # Check if data file exists first
+    if not os.path.exists(CSV_PATH):
+        st.error(f"Data file not found: {CSV_PATH}")
+        st.info("Please make sure your data is in the correct location. The app expects data in: data/indonesia_data.csv")
+        
+        # Create a sample data file for demo purposes if it doesn't exist
+        try:
+            os.makedirs(os.path.dirname(CSV_PATH), exist_ok=True)
+            
+            # Check if we should create sample data
+            create_sample = st.button("Create sample data file for demonstration")
+            
+            if create_sample:
+                # Create minimal sample data
+                st.info("Creating sample data file...")
+                
+                # Generate sample data
+                import numpy as np
+                from datetime import datetime, timedelta
+                
+                # Create dates
+                base_date = datetime(2023, 1, 1)
+                dates = [base_date + timedelta(days=i) for i in range(30)]
+                
+                # Create provinces
+                provinces = ['Java', 'Sumatra', 'Sulawesi', 'Kalimantan', 'Papua']
+                
+                # Create DataFrame
+                rows = []
+                for date in dates:
+                    for province in provinces:
+                        # Random cases between 0 and 100
+                        cases = int(np.random.randint(0, 100))
+                        rows.append({
+                            'Date': date.strftime('%Y-%m-%d'),
+                            'Location': province,
+                            'New Cases': cases
+                        })
+                
+                sample_df = pd.DataFrame(rows)
+                
+                # Save to CSV
+                sample_df.to_csv(CSV_PATH, sep=';', index=False)
+                st.success(f"Sample data created at {CSV_PATH}")
+                st.info("Refresh the page to use the sample data")
+        except Exception as e:
+            st.error(f"Could not create sample data: {e}")
+        
+        st.stop()
+        
     raw_df, all_dates, date_strings, date_metrics, top_provinces, trend_data = load_and_prepare_base_data(CSV_PATH)
     geojson_data = prepare_geojson()
 
 if raw_df is None or geojson_data is None:
     st.error("Failed to load required data. Please check your data files.")
+    
+    # Show more helpful error details
+    if raw_df is None:
+        st.info(f"The CSV file was found but could not be processed. Make sure it has the correct columns (Date, Location, New Cases) and separator (;).")
+    
+    if geojson_data is None:
+        st.info(f"Could not load GeoJSON data. Make sure the shapefile exists in the {SHAPEFILE_DIR} directory.")
+        
+        # Check which shapefiles exist
+        shapefile_options = [
+            f"{SHAPEFILE_DIR}/IDN_Indonesia_1.shp",
+            f"{SHAPEFILE_DIR}/IDN_adm1.shp",
+            f"{SHAPEFILE_DIR}/indonesia.shp",
+            f"{SHAPEFILE_DIR}/IDN.shp"
+        ]
+        
+        existing_files = [f for f in shapefile_options if os.path.exists(f)]
+        if existing_files:
+            st.info(f"Found these shapefiles: {', '.join(existing_files)}")
+        else:
+            st.info(f"No shapefiles found in {SHAPEFILE_DIR}. Please add the shapefile to this directory.")
+    
     st.stop()
 
 # Determine the right property key for provinces in GeoJSON
