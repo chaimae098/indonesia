@@ -133,7 +133,13 @@ def prepare_geojson():
     if os.path.exists(geojson_path):
         try:
             with open(geojson_path, 'r') as f:
-                return json.load(f)
+                geojson_data = json.load(f)
+                # Inspect structure to identify available properties
+                if 'features' in geojson_data and len(geojson_data['features']) > 0:
+                    sample_feature = geojson_data['features'][0]
+                    available_properties = sample_feature.get('properties', {}).keys()
+                    st.session_state['geojson_properties'] = list(available_properties)
+                return geojson_data
         except Exception as e:
             st.warning(f"Could not load cached GeoJSON: {e}")
     
@@ -162,11 +168,20 @@ def prepare_geojson():
         # Load and simplify
         shp = gpd.read_file(shapefile_path)
         
+        # Inspect the shapefile's columns to identify province name column
+        st.session_state['shapefile_columns'] = list(shp.columns)
+        
         # Simplify to reduce file size (tolerance controls simplification level)
         shp_simple = shp.simplify(tolerance=0.01)
         
         # Convert to GeoJSON
         geojson_data = json.loads(shp_simple.to_json())
+        
+        # Store available properties
+        if 'features' in geojson_data and len(geojson_data['features']) > 0:
+            sample_feature = geojson_data['features'][0]
+            available_properties = sample_feature.get('properties', {}).keys()
+            st.session_state['geojson_properties'] = list(available_properties)
         
         # Cache for future use
         with open(geojson_path, 'w') as f:
@@ -186,6 +201,15 @@ with st.spinner("Loading COVID-19 data..."):
 if raw_df is None or geojson_data is None:
     st.error("Failed to load required data. Please check your data files.")
     st.stop()
+
+# Determine the right property key for provinces in GeoJSON
+# Check if we need to inspect GeoJSON structure
+if 'geojson_properties' not in st.session_state and geojson_data:
+    # Inspect structure to identify available properties
+    if 'features' in geojson_data and len(geojson_data['features']) > 0:
+        sample_feature = geojson_data['features'][0]
+        available_properties = sample_feature.get('properties', {}).keys()
+        st.session_state['geojson_properties'] = list(available_properties)
 
 # Function to get data for a specific date (very fast)
 def get_date_data(raw_df, date_obj):
@@ -215,6 +239,34 @@ with col1:
     
     # Add data table toggle
     show_table = st.checkbox("Show data table", value=False)
+    
+    # Add GeoJSON property selection
+    if 'geojson_properties' in st.session_state:
+        property_options = st.session_state['geojson_properties']
+        
+        # Try to find the best property key for provinces
+        default_property = None
+        priority_names = ['NAME_1', 'name', 'province', 'PROVINCE', 'name_1', 'NAME', 'ADMIN']
+        
+        for name in priority_names:
+            if name in property_options:
+                default_property = name
+                break
+                
+        if default_property is None and property_options:
+            default_property = property_options[0]
+            
+        selected_property = st.selectbox(
+            "Select GeoJSON property for provinces:",
+            options=property_options,
+            index=property_options.index(default_property) if default_property in property_options else 0
+        )
+        
+        # Store the selected property
+        st.session_state['selected_property'] = selected_property
+    else:
+        # Fallback to default property
+        st.session_state['selected_property'] = 'NAME_1'
 
 # Create map function
 def make_fast_map(geojson_data, date_data, date_str):
@@ -233,23 +285,59 @@ def make_fast_map(geojson_data, date_data, date_str):
         prefer_canvas=True
     )
     
+    # Use the correct property key from session state
+    property_key = st.session_state.get('selected_property', 'NAME_1')
+    key_on = f'feature.properties.{property_key}'
+    
     # Add choropleth
-    folium.Choropleth(
-        geo_data=geojson_data,
-        name="choropleth",
-        data=province_data,
-        columns=["Province", "Value"],  # Not actually used with data_dict
-        key_on='feature.properties.NAME_1',
-        fill_color='YlOrRd',
-        fill_opacity=0.7,
-        line_opacity=0.2,
-        legend_name=f"New COVID-19 Cases ({date_str})",
-        highlight=True,
-        smooth_factor=0.5,
-        line_color='#ffffff',
-        line_weight=0.5,
-        data_dict=province_data  # Direct data dictionary is much faster
-    ).add_to(m)
+    try:
+        folium.Choropleth(
+            geo_data=geojson_data,
+            name="choropleth",
+            data=province_data,
+            columns=["Province", "Value"],  # Not actually used with data_dict
+            key_on=key_on,
+            fill_color='YlOrRd',
+            fill_opacity=0.7,
+            line_opacity=0.2,
+            legend_name=f"New COVID-19 Cases ({date_str})",
+            highlight=True,
+            smooth_factor=0.5,
+            line_color='#ffffff',
+            line_weight=0.5,
+            data_dict=province_data  # Direct data dictionary is much faster
+        ).add_to(m)
+    except Exception as e:
+        st.error(f"Error creating choropleth with property '{property_key}': {e}")
+        
+        # Fallback to just displaying the base map with borders
+        folium.GeoJson(
+            geojson_data,
+            name='geojson',
+            style_function=lambda x: {
+                'fillColor': '#ffff00',
+                'color': '#000000',
+                'fillOpacity': 0.1,
+                'weight': 0.5
+            }
+        ).add_to(m)
+        
+        # Add a marker with sample properties to help debug
+        if 'features' in geojson_data and len(geojson_data['features']) > 0:
+            sample_feature = geojson_data['features'][0]
+            props = sample_feature.get('properties', {})
+            
+            # Find a centroid point if geometry exists
+            if 'geometry' in sample_feature and sample_feature['geometry'].get('type') == 'Polygon':
+                coords = sample_feature['geometry']['coordinates'][0]
+                # Simple centroid calc
+                lat = sum(c[1] for c in coords) / len(coords)
+                lon = sum(c[0] for c in coords) / len(coords)
+                
+                folium.Marker(
+                    [lat, lon],
+                    popup=f"Sample Properties: {props}"
+                ).add_to(m)
     
     # Add title to map
     title_html = '''
@@ -266,6 +354,10 @@ def make_fast_map(geojson_data, date_data, date_str):
 with col2:
     # Create and display map with subheader
     st.subheader(f"Choropleth for {selected_date_str}")
+    
+    # Show property key info
+    if 'selected_property' in st.session_state:
+        st.caption(f"Using GeoJSON property: '{st.session_state['selected_property']}' to map provinces")
     
     try:
         # Convert string date back to datetime
@@ -387,6 +479,16 @@ with st.expander("Debug & Performance Information", expanded=False):
     st.write("Cache Info:")
     for key, val in st.cache_data.get_stats().items():
         st.write(f"- {key}: {val}")
+    
+    # Show GeoJSON Properties
+    if 'geojson_properties' in st.session_state:
+        st.write("Available GeoJSON Properties:")
+        st.write(st.session_state['geojson_properties'])
+    
+    # Show Shapefile Columns
+    if 'shapefile_columns' in st.session_state:
+        st.write("Shapefile Columns:")
+        st.write(st.session_state['shapefile_columns'])
         
     # Additional debug info
     if st.checkbox("Show raw data sample"):
@@ -396,3 +498,9 @@ with st.expander("Debug & Performance Information", expanded=False):
     if st.checkbox("Show pre-computed metrics"):
         st.write("Pre-computed metrics for first 3 dates:")
         st.json({k: date_metrics[k] for k in list(date_metrics.keys())[:3]})
+    
+    # Show GeoJSON Feature Sample
+    if st.checkbox("Show GeoJSON sample"):
+        if geojson_data and 'features' in geojson_data and len(geojson_data['features']) > 0:
+            st.write("Sample GeoJSON Feature:")
+            st.json(geojson_data['features'][0])
