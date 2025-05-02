@@ -33,27 +33,42 @@ h2, h3 {color: #2563EB;}
 # Title
 st.title("Indonesia COVID-19 New Cases Choropleth Map")
 
-# Improved data loading with optimized caching strategy
+# Improved data loading with optimized caching strategy and better error handling
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_csv(csv_path):
     """Load and preprocess CSV data efficiently"""
-    df = pd.read_csv(csv_path, sep=';')
-    df['New Cases'] = pd.to_numeric(df['New Cases'], errors='coerce')
-    df = df[df['Location'] != 'Indonesia']  # drop country-wide aggregate
-    df['Date'] = pd.to_datetime(df['Date'])
-    return df
+    try:
+        df = pd.read_csv(csv_path, sep=';')
+        df['New Cases'] = pd.to_numeric(df['New Cases'], errors='coerce')
+        df = df[df['Location'] != 'Indonesia']  # drop country-wide aggregate
+        df['Date'] = pd.to_datetime(df['Date'])
+        return df
+    except Exception as e:
+        st.error(f"Error loading CSV: {str(e)}")
+        return pd.DataFrame()  # Return empty DataFrame on error
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_shapefile(shapefile_path):
     """Load shapefile separately to optimize memory usage"""
-    return gpd.read_file(shapefile_path)
+    try:
+        return gpd.read_file(shapefile_path)
+    except Exception as e:
+        st.error(f"Error loading shapefile: {str(e)}")
+        return None
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def process_data(df):
     """Create pivot table and date strings once"""
-    pivot = df.pivot(index='Date', columns='Location', values='New Cases').reset_index()
-    date_strings = pivot['Date'].dt.strftime('%m/%d/%Y').tolist()
-    return pivot, date_strings
+    try:
+        if df.empty:
+            return pd.DataFrame(), []
+        
+        pivot = df.pivot(index='Date', columns='Location', values='New Cases').reset_index()
+        date_strings = pivot['Date'].dt.strftime('%m/%d/%Y').tolist()
+        return pivot, date_strings
+    except Exception as e:
+        st.error(f"Error processing data: {str(e)}")
+        return pd.DataFrame(), []
 
 # Split the choropleth data creation to avoid unhashable parameter error
 def create_choropleth_data(pivot, shp):
@@ -118,24 +133,45 @@ col1, col2 = st.columns([1, 3])
 
 with col1:
     st.subheader("Date Selection")
-    selected_date = st.select_slider(
-        "Select date:",
-        options=dates_sorted,
-        value=dates_sorted[-1]
-    )
     
-    # Calculate COVID metrics for selected date - optimized
-    date_obj = datetime.strptime(selected_date, '%m/%d/%Y')
-    date_data = data_pivot.set_index('Date').loc[date_obj]
+    # Handle empty dates list
+    if not dates_sorted:
+        st.error("No dates available in the data")
+        selected_date = ""
+    else:
+        selected_date = st.select_slider(
+            "Select date:",
+            options=dates_sorted,
+            value=dates_sorted[-1] if dates_sorted else ""
+        )
     
-    total_cases = int(date_data.sum())
-    max_province = date_data.idxmax()
-    max_cases = int(date_data.max())
-    
-    # Display metrics
-    st.metric("Total New Cases", f"{total_cases:,}")
-    st.metric("Highest Province", max_province)
-    st.metric("Cases in Highest", f"{max_cases:,}")
+    # Calculate COVID metrics for selected date - with error handling
+    try:
+        if selected_date and not data_pivot.empty:
+            date_obj = datetime.strptime(selected_date, '%m/%d/%Y')
+            
+            # Safely access data for the selected date
+            if date_obj in data_pivot['Date'].values:
+                date_data = data_pivot.set_index('Date').loc[date_obj]
+                
+                # Calculate metrics with safety checks
+                total_cases = int(date_data.sum()) if not date_data.empty else 0
+                
+                if not date_data.empty:
+                    max_province = date_data.idxmax()
+                    max_cases = int(date_data.max())
+                else:
+                    max_province = "N/A"
+                    max_cases = 0
+                
+                # Display metrics
+                st.metric("Total New Cases", f"{total_cases:,}")
+                st.metric("Highest Province", max_province)
+                st.metric("Cases in Highest", f"{max_cases:,}")
+            else:
+                st.warning(f"No data available for {selected_date}")
+    except Exception as e:
+        st.error(f"Error calculating metrics: {str(e)}")
     
     # Add data table toggle
     show_table = st.checkbox("Show data table", value=False)
@@ -193,44 +229,65 @@ with col2:
     # Create and display map
     st.subheader(f"Choropleth for {selected_date}")
     
-    if selected_date in gdf.columns:
-        with st.spinner(f"Creating map for {selected_date}..."):
-            m = make_lightweight_map(gdf, selected_date)
-            folium_static(m, width=800, height=500)
+    if gdf is not None and selected_date in gdf.columns:
+        try:
+            with st.spinner(f"Creating map for {selected_date}..."):
+                m = make_lightweight_map(gdf, selected_date)
+                folium_static(m, width=800, height=500)
+        except Exception as e:
+            st.error(f"Error creating map: {str(e)}")
+            st.info("Try selecting a different date or refreshing the page.")
     else:
         st.error(f"Selected date {selected_date} not available in the data")
 
 # Display data table conditionally - optimized query
 if show_table:
     st.subheader("Data Table")
-    # Get data for selected date efficiently
-    date_obj = datetime.strptime(selected_date, '%m/%d/%Y')
-    table_data = data_pivot.set_index('Date').loc[date_obj].sort_values(ascending=False).reset_index()
-    table_data.columns = ['Province', 'New Cases']
-    table_data = table_data[table_data['New Cases'].notna()]
-    
-    # Use a more efficient table display
-    st.dataframe(
-        table_data,
-        column_config={
-            "Province": st.column_config.TextColumn("Province"),
-            "New Cases": st.column_config.NumberColumn("New Cases", format="%d")
-        },
-        use_container_width=True,
-        hide_index=True
-    )
+    try:
+        # Get data for selected date efficiently
+        date_obj = datetime.strptime(selected_date, '%m/%d/%Y')
+        
+        # Safely access the data
+        if date_obj in data_pivot['Date'].values:
+            table_data = data_pivot.set_index('Date').loc[date_obj].sort_values(ascending=False).reset_index()
+            table_data.columns = ['Province', 'New Cases']
+            table_data = table_data[table_data['New Cases'].notna()]
+            
+            # Use a more efficient table display - limiting to top 20 rows for performance
+            st.dataframe(
+                table_data.head(20),  # Limit rows for better performance
+                column_config={
+                    "Province": st.column_config.TextColumn("Province"),
+                    "New Cases": st.column_config.NumberColumn("New Cases", format="%d")
+                },
+                use_container_width=True,
+                hide_index=True
+            )
+            
+            if len(table_data) > 20:
+                st.info(f"Showing top 20 out of {len(table_data)} provinces for better performance.")
+        else:
+            st.warning(f"No data available for {selected_date}")
+    except Exception as e:
+        st.error(f"Error displaying table: {str(e)}")
+
+# Define trend data filtering function before using it
+@st.cache_data(ttl=3600)
+def get_trend_data(df, province_list):
+    """Filter data for specific provinces using simple list of strings"""
+    return df[df['Location'].isin(province_list)].copy()
+
+# Cache province list to avoid recalculation
+@st.cache_data(ttl=3600)
+def get_top_provinces(df, n=3):
+    """Get top provinces by case count"""
+    return list(df['Location'].value_counts().nlargest(n).index)
 
 # Optimized trend analysis section - using precomputed data
 show_trends = st.checkbox("Show COVID-19 Trend Analysis", value=True)
 
 if show_trends:
     st.subheader("COVID-19 Trend Analysis")
-
-    # Cache province list to avoid recalculation - using a simplified version
-    @st.cache_data(ttl=3600)
-    def get_top_provinces(df, n=3):
-        # Convert to strings to make hashable
-        return list(df['Location'].value_counts().nlargest(n).index)
 
     # Only compute if checkbox is checked
     top_provinces = get_top_provinces(raw_df)
@@ -244,6 +301,7 @@ if show_trends:
 
     # Only render chart if provinces are selected
     if provinces:
+        # Get filtered data
         trend_data = get_trend_data(raw_df, provinces)
         
         # Create minimal plotly chart with optimized parameters
