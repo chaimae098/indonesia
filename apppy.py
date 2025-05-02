@@ -6,29 +6,27 @@ from streamlit_folium import folium_static
 from datetime import datetime
 import plotly.express as px
 import os
+import numpy as np
+import gc  # For garbage collection
 
 # --- CONFIG ---
 CSV_PATH = 'data/indonesia_data.csv'
 SHAPEFILE_DIR = 'data'
 
-# Set page configuration
+# Set page configuration - optimized for performance
 st.set_page_config(
     page_title="Indonesia COVID-19 Dashboard",
     page_icon="🦠",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="collapsed"  # Start collapsed for faster initial load
 )
 
-# Apply custom CSS for better aesthetics - moved to external CSS to improve loading time
+# Minimal CSS for better load time
 st.markdown("""
 <style>
-    .main {background-color: #f5f7f9;}
-    h1 {color: #1E3A8A; font-family: 'Helvetica Neue', sans-serif; padding-bottom: 20px;}
-    h2, h3 {color: #2563EB; font-family: 'Helvetica Neue', sans-serif;}
-    .stSlider > div > div > div {background-color: #EF4444;}
-    .stSlider [data-baseweb="slider"] {height: 6px;}
-    div[data-testid="stExpander"] p {font-size: 16px;}
-    .map-container {background-color: white; border-radius: 10px; padding: 20px; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);}
+.main {background-color: #f5f7f9;}
+h1 {color: #1E3A8A;}
+h2, h3 {color: #2563EB;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -57,43 +55,57 @@ def process_data(df):
     date_strings = pivot['Date'].dt.strftime('%m/%d/%Y').tolist()
     return pivot, date_strings
 
-@st.cache_data(ttl=3600, show_spinner=False)
+# Split the choropleth data creation to avoid unhashable parameter error
 def create_choropleth_data(pivot, shp):
-    """Pre-compute merged geodataframe for all dates"""
-    # Create a dictionary to store each date's data
-    date_data_dict = {}
+    """Pre-compute merged geodataframe for all dates - without caching"""
+    # Create a dictionary to store province-to-cases mapping for each date
+    date_mappings = {}
     
     # Process each date once
     for date in pivot['Date']:
         date_str = date.strftime('%m/%d/%Y')
         date_data = pivot.set_index('Date').loc[date].reset_index()
         date_data.columns = ['Province', 'New_Cases']
-        date_data_dict[date_str] = date_data
+        # Store mapping as a simple dictionary
+        province_to_cases = dict(zip(date_data['Province'], date_data['New_Cases']))
+        date_mappings[date_str] = province_to_cases
     
     # Merge with shapefile once
     merged_gdf = shp.copy()
     
     # Add data for each date
-    for date_str, date_data in date_data_dict.items():
-        # Use efficient merge
-        province_to_cases = dict(zip(date_data['Province'], date_data['New_Cases']))
-        merged_gdf[date_str] = merged_gdf['NAME_1'].map(province_to_cases)
+    for date_str, mapping in date_mappings.items():
+        merged_gdf[date_str] = merged_gdf['NAME_1'].map(mapping)
     
     return merged_gdf
 
 # Load data in stages to improve memory usage
 with st.spinner("Loading COVID-19 data..."):
-    # Load raw data
-    raw_df = load_csv(CSV_PATH)
-    shp = load_shapefile(f"{SHAPEFILE_DIR}/IDN_Indonesia_1.shp")
-    
-    # Process data
-    data_pivot, dates = process_data(raw_df)
-    gdf = create_choropleth_data(data_pivot, shp)
-
-if raw_df.empty or gdf is None:
-    st.error("Failed to load data. Please check your file paths and data format.")
-    st.stop()
+    try:
+        # Load raw data first
+        raw_df = load_csv(CSV_PATH)
+        
+        # Only proceed if CSV loaded correctly
+        if raw_df.empty:
+            st.error("CSV data is empty. Please check your data file.")
+            st.stop()
+            
+        # Load shapefile second
+        shp = load_shapefile(f"{SHAPEFILE_DIR}/IDN_Indonesia_1.shp")
+        
+        # Process data
+        data_pivot, dates = process_data(raw_df)
+        
+        # Create choropleth data after all previous steps succeed
+        gdf = create_choropleth_data(data_pivot, shp)
+        
+        # Quick verification
+        if gdf.empty:
+            st.error("Failed to create map data.")
+            st.stop()
+    except Exception as e:
+        st.error(f"Error loading data: {str(e)}")
+        st.stop()
 
 # Sort dates chronologically
 dates_dt = [datetime.strptime(d, '%m/%d/%Y') for d in dates]
@@ -128,11 +140,10 @@ with col1:
     # Add data table toggle
     show_table = st.checkbox("Show data table", value=False)
 
-# Create map with simplified GeoJSON for better performance
-@st.cache_data(ttl=3600)
+# Create map with simplified GeoJSON for better performance - without caching to avoid unhashable type errors
 def make_lightweight_map(gdf, date):
     """Create a more efficient map by simplifying geometries"""
-    # Create base map
+    # Create base map with minimal settings for better performance
     m = folium.Map(
         location=[-2.5, 118], 
         zoom_start=5, 
@@ -140,50 +151,40 @@ def make_lightweight_map(gdf, date):
         prefer_canvas=True
     )
     
+    # Work with a copy to avoid modifying the original
+    data_for_map = gdf[['NAME_1', date, 'geometry']].copy()
+    
     # Simplify geometries for better performance
-    simplified_gdf = gdf.copy()
-    if hasattr(simplified_gdf.geometry.iloc[0], 'simplify'):
-        simplified_gdf['geometry'] = simplified_gdf['geometry'].simplify(0.01)
+    if hasattr(data_for_map.geometry.iloc[0], 'simplify'):
+        data_for_map['geometry'] = data_for_map['geometry'].simplify(0.01)
     
-    # Convert to geojson only once
-    geo_data = simplified_gdf.__geo_interface__
-    
-    # Add choropleth
+    # Add choropleth - keeping only essential parameters
     choropleth = folium.Choropleth(
-        geo_data=geo_data,
+        geo_data=data_for_map.__geo_interface__,
         name="choropleth",
-        data=simplified_gdf,
+        data=data_for_map,
         columns=['NAME_1', date],
         key_on='feature.properties.NAME_1',
         fill_color='YlOrRd',
         fill_opacity=0.7,
         line_opacity=0.2,
         legend_name=f"New COVID-19 Cases ({date})",
-        highlight=True,
-        smooth_factor=1.0  # Increased for better performance
+        smooth_factor=1.0  # Higher for better performance
     ).add_to(m)
     
-    # Add tooltips with optimized styling
+    # Add tooltips with minimal styling for better performance
     folium.GeoJson(
-        simplified_gdf[['NAME_1', date, 'geometry']],  # Only include needed columns
-        style_function=lambda x: {'fillColor': '#ffffff', 'color':'#000000', 'fillOpacity': 0.1, 'weight': 0.1},
-        highlight_function=lambda x: {'fillColor': '#000000', 'color':'#000000', 'fillOpacity': 0.50, 'weight': 0.1},
+        data_for_map,
+        style_function=lambda x: {'weight': 0.1},
         tooltip=folium.features.GeoJsonTooltip(
             fields=['NAME_1', date],
             aliases=['Province:', 'New cases:'],
-            style=("background-color: white; color: #333333; font-family: arial; font-size: 12px; "
-                  "padding: 10px; border-radius: 5px; box-shadow: 0 0 5px rgba(0,0,0,0.2)") 
+            style="background-color: white; font-size: 12px; padding: 5px;"
         )
     ).add_to(m)
     
     # Add simplified title to map
-    title_html = f'''
-    <div style="position: fixed; top: 10px; left: 50px; width: 250px; height: 30px; 
-    background-color: rgba(255,255,255,0.8); border-radius: 5px; 
-    font-size: 14px; font-weight: bold; text-align: center; 
-    line-height: 30px; padding: 5px; box-shadow: 0 0 5px rgba(0,0,0,0.2)">
-    COVID-19 New Cases: {date}</div>
-    '''
+    title_html = f'<div style="position:fixed;top:10px;left:50px;background-color:white;padding:5px;font-size:14px;">COVID-19 New Cases: {date}</div>'
     m.get_root().html.add_child(folium.Element(title_html))
     
     return m
@@ -220,52 +221,59 @@ if show_table:
     )
 
 # Optimized trend analysis section - using precomputed data
-st.subheader("COVID-19 Trend Analysis")
+show_trends = st.checkbox("Show COVID-19 Trend Analysis", value=True)
 
-# Cache province list to avoid recalculation
-@st.cache_data(ttl=3600)
-def get_top_provinces(df, n=3):
-    return df['Location'].value_counts().nlargest(n).index.tolist()
+if show_trends:
+    st.subheader("COVID-19 Trend Analysis")
 
-top_provinces = get_top_provinces(raw_df)
-provinces = st.multiselect(
-    "Select provinces to compare:",
-    options=sorted(raw_df['Location'].unique()),
-    default=top_provinces
-)
-
-# Efficient trend data filtering
-if provinces:
-    # Pre-filter data for selected provinces
+    # Cache province list to avoid recalculation - using a simplified version
     @st.cache_data(ttl=3600)
-    def get_trend_data(df, selected_provinces):
-        filtered_data = df[df['Location'].isin(selected_provinces)].copy()
-        return filtered_data
+    def get_top_provinces(df, n=3):
+        # Convert to strings to make hashable
+        return list(df['Location'].value_counts().nlargest(n).index)
+
+    # Only compute if checkbox is checked
+    top_provinces = get_top_provinces(raw_df)
+    all_provinces = sorted(raw_df['Location'].unique())
     
-    trend_data = get_trend_data(raw_df, provinces)
-    
-    # Create plotly chart with optimized parameters
-    fig = px.line(
-        trend_data, 
-        x='Date', 
-        y='New Cases', 
-        color='Location',
-        title="COVID-19 New Cases Trend",
-        labels={"Date": "Date", "New Cases": "New Cases", "Location": "Province"}
+    provinces = st.multiselect(
+        "Select provinces to compare:",
+        options=all_provinces,
+        default=top_provinces
     )
-    
-    # Optimize plotly render performance
-    fig.update_layout(
-        height=450,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        margin=dict(l=40, r=40, t=40, b=40),
-        hovermode="closest"
-    )
-    
-    # Set decimals to 0 for better performance and readability
-    fig.update_yaxes(tickformat=",.0f")
-    
-    st.plotly_chart(fig, use_container_width=True)
+
+    # Only render chart if provinces are selected
+    if provinces:
+        trend_data = get_trend_data(raw_df, provinces)
+        
+        # Create minimal plotly chart with optimized parameters
+        fig = px.line(
+            trend_data, 
+            x='Date', 
+            y='New Cases', 
+            color='Location',
+            title="COVID-19 New Cases Trend"
+        )
+        
+        # Optimize plotly render performance - minimal settings
+        fig.update_layout(
+            height=450,
+            margin=dict(l=20, r=20, t=40, b=20),
+            hovermode="closest",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        )
+        
+        # Reduce points for smoother rendering if large dataset
+        if len(trend_data) > 1000:
+            fig.update_traces(simplify=True)
+        
+        # Set decimals to 0 for better performance
+        fig.update_yaxes(tickformat=",.0f")
+        
+        st.plotly_chart(fig, use_container_width=True)
+        
+        # Force garbage collection after chart render
+        gc.collect()
 
 # Add footer
 st.markdown("""
