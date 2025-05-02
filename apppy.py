@@ -9,7 +9,7 @@ import json
 import time
 
 # --- CONFIG ---
-CSV_PATH = 'data/indonesia_data.csv'  # Updated path to match first code example
+CSV_PATH = 'data/indonesia_data.csv'
 SHAPEFILE_DIR = 'data'
 CACHE_DIR = 'cache'
 
@@ -55,7 +55,6 @@ st.markdown("""
 
 # Ensure directories exist
 os.makedirs(CACHE_DIR, exist_ok=True)
-# If data directory doesn't exist, create it
 os.makedirs(SHAPEFILE_DIR, exist_ok=True)
 
 # Title
@@ -72,18 +71,23 @@ def load_and_prepare_base_data(csv_path):
     
     try:
         # Load CSV with direct date parsing
-        df = pd.read_csv(csv_path, sep=';', parse_dates=['Date'])
+        df = pd.read_csv(csv_path, sep=';')
+        
+        # Convert date strings to datetime objects if they're not already
+        if not pd.api.types.is_datetime64_any_dtype(df['Date']):
+            df['Date'] = pd.to_datetime(df['Date'])
+            
         df['New Cases'] = pd.to_numeric(df['New Cases'], errors='coerce')
         df = df[df['Location'] != 'Indonesia']  # drop country-wide aggregate
         
         # Get unique dates in chronological order
         all_dates = sorted(df['Date'].unique())
-        date_strings = [d.strftime('%m/%d/%Y') for d in all_dates]
+        date_strings = [d.strftime('%Y-%m-%d') for d in all_dates]
         
         # Pre-compute metrics for all dates
         date_metrics = {}
         for date in all_dates:
-            date_str = date.strftime('%m/%d/%Y')
+            date_str = date.strftime('%Y-%m-%d')
             date_data = df[df['Date'] == date]
             
             if not date_data.empty:
@@ -114,7 +118,7 @@ def load_and_prepare_base_data(csv_path):
                 'values': province_data['New Cases'].fillna(0).tolist()
             }
         
-        print(f"Data loading took {time.time() - start_time:.2f} seconds")
+        st.write(f"Data loading took {time.time() - start_time:.2f} seconds")
         return df, all_dates, date_strings, date_metrics, top_provinces, trend_data
     except Exception as e:
         st.error(f"Error loading data: {e}")
@@ -136,11 +140,11 @@ def prepare_geojson():
         try:
             with open(geojson_path, 'r') as f:
                 geojson_data = json.load(f)
-                # Inspect structure to identify available properties
+                # Store available properties in session state
                 if 'features' in geojson_data and len(geojson_data['features']) > 0:
                     sample_feature = geojson_data['features'][0]
-                    available_properties = sample_feature.get('properties', {}).keys()
-                    st.session_state['geojson_properties'] = list(available_properties)
+                    available_properties = list(sample_feature.get('properties', {}).keys())
+                    st.session_state['geojson_properties'] = available_properties
                 return geojson_data
         except Exception as e:
             st.warning(f"Could not load cached GeoJSON: {e}")
@@ -170,7 +174,7 @@ def prepare_geojson():
         # Load and simplify
         shp = gpd.read_file(shapefile_path)
         
-        # Inspect the shapefile's columns to identify province name column
+        # Store shapefile columns in session state
         st.session_state['shapefile_columns'] = list(shp.columns)
         
         # Simplify to reduce file size (tolerance controls simplification level)
@@ -179,11 +183,11 @@ def prepare_geojson():
         # Convert to GeoJSON
         geojson_data = json.loads(shp_simple.to_json())
         
-        # Store available properties
+        # Store available properties in session state
         if 'features' in geojson_data and len(geojson_data['features']) > 0:
             sample_feature = geojson_data['features'][0]
-            available_properties = sample_feature.get('properties', {}).keys()
-            st.session_state['geojson_properties'] = list(available_properties)
+            available_properties = list(sample_feature.get('properties', {}).keys())
+            st.session_state['geojson_properties'] = available_properties
         
         # Cache for future use
         with open(geojson_path, 'w') as f:
@@ -276,17 +280,27 @@ if raw_df is None or geojson_data is None:
     
     st.stop()
 
-# Determine the right property key for provinces in GeoJSON
+# Ensure we have the geojson_properties in session state
 if 'geojson_properties' not in st.session_state and geojson_data:
     # Inspect structure to identify available properties
     if 'features' in geojson_data and len(geojson_data['features']) > 0:
         sample_feature = geojson_data['features'][0]
-        available_properties = sample_feature.get('properties', {}).keys()
-        st.session_state['geojson_properties'] = list(available_properties)
+        available_properties = list(sample_feature.get('properties', {}).keys())
+        st.session_state['geojson_properties'] = available_properties
 
 # Function to get data for a specific date (very fast)
-def get_date_data(raw_df, date_obj):
+def get_date_data(raw_df, date_str):
     """Get data for specific date with minimal processing"""
+    # Convert string to datetime if needed
+    if isinstance(date_str, str):
+        try:
+            date_obj = datetime.strptime(date_str, '%Y-%m-%d')
+        except ValueError:
+            # Try alternative format
+            date_obj = datetime.strptime(date_str, '%m/%d/%Y')
+    else:
+        date_obj = date_str
+        
     date_data = raw_df[raw_df['Date'] == date_obj].copy()
     return date_data
 
@@ -299,7 +313,7 @@ with col1:
     selected_date_str = st.select_slider(
         "Select date:",
         options=date_strings,
-        value=date_strings[-1]
+        value=date_strings[-1] if date_strings else None
     )
     
     # Display pre-computed metrics
@@ -313,7 +327,7 @@ with col1:
     show_table = st.checkbox("Show data table", value=False)
     
     # Add GeoJSON property selection
-    if 'geojson_properties' in st.session_state:
+    if 'geojson_properties' in st.session_state and st.session_state['geojson_properties']:
         property_options = st.session_state['geojson_properties']
         
         # Try to find the best property key for provinces
@@ -359,6 +373,15 @@ def make_fast_map(geojson_data, date_data):
     
     # Use the correct property key from session state
     property_key = st.session_state.get('selected_property', 'NAME_1')
+    
+    # Make sure property_key is not None
+    if not property_key and 'geojson_properties' in st.session_state and st.session_state['geojson_properties']:
+        property_key = st.session_state['geojson_properties'][0]
+    
+    # Still fallback to a default if needed
+    if not property_key:
+        property_key = 'NAME_1'
+        
     key_on = f'feature.properties.{property_key}'
     
     # Add choropleth
@@ -431,11 +454,8 @@ with col2:
         st.caption(f"Using GeoJSON property: '{st.session_state['selected_property']}' to map provinces")
     
     try:
-        # Convert string date back to datetime
-        selected_date_obj = datetime.strptime(selected_date_str, '%m/%d/%Y')
-        
         # Get data for this date (fast)
-        date_data = get_date_data(raw_df, selected_date_obj)
+        date_data = get_date_data(raw_df, selected_date_str)
         
         # Only create map if there's data
         if not date_data.empty:
@@ -452,11 +472,8 @@ with col2:
 if show_table and raw_df is not None:
     st.subheader("Data Table")
     try:
-        # Convert selected_date_str to datetime
-        selected_date_obj = datetime.strptime(selected_date_str, '%m/%d/%Y')
-        
-        # Filter data for selected date
-        table_data = raw_df[raw_df['Date'] == selected_date_obj][['Location', 'New Cases']].copy()
+        # Get data for selected date
+        table_data = get_date_data(raw_df, selected_date_str)[['Location', 'New Cases']].copy()
         table_data = table_data[table_data['New Cases'].notna()].sort_values('New Cases', ascending=False)
         
         # Display with formatting
@@ -551,10 +568,16 @@ with st.expander("Debug & Performance Information", expanded=False):
     st.write("Total number of provinces:", raw_df['Location'].nunique())
     st.write("Total data points:", len(raw_df))
     
-    # Cache info
+    # Cache info - Fixed the AttributeError here
     st.write("Cache Info:")
-    for key, val in st.cache_data.get_stats().items():
-        st.write(f"- {key}: {val}")
+    try:
+        # For newer Streamlit versions
+        cache_data_stats = st.cache_data.get_stats()
+        for key, val in cache_data_stats.items():
+            st.write(f"- {key}: {val}")
+    except (AttributeError, TypeError):
+        # Fallback for older Streamlit versions or if get_stats() isn't available
+        st.write("- Cache statistics not available in this Streamlit version")
     
     # Show GeoJSON Properties
     if 'geojson_properties' in st.session_state:
