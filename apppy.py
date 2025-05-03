@@ -313,6 +313,9 @@ with col2:
                 # If it's already a dict-like object, use directly
                 gdf_json_dict = gdf.__geo_interface__
             
+            # Create a dictionary to map province names to case counts for interactive features
+            province_to_cases = dict(zip(date_data['Location'], date_data['New Cases']))
+            
             # Add choropleth with optimized rendering
             choropleth = folium.Choropleth(
                 geo_data=gdf_json_dict,
@@ -328,55 +331,48 @@ with col2:
                 smooth_factor=0.5
             ).add_to(m)
             
-            # Create a dictionary to map province names to case counts for tooltips
-            province_to_cases = dict(zip(date_data['Location'], date_data['New Cases']))
-            
-            # Create a function to get cases by province name
-            def get_cases(province_name):
-                return province_to_cases.get(province_name, 'No data')
-            
-            # Add tooltips with province name AND case count
-            geojson = folium.GeoJson(
-                gdf_json_dict,
-                style_function=lambda x: {'fillColor': '#ffffff', 'color':'#000000', 'fillOpacity': 0.1, 'weight': 0.1},
-                control=False,
-                highlight_function=lambda x: {'fillColor': '#000000', 'color':'#000000', 'fillOpacity': 0.50, 'weight': 0.1},
-                tooltip=folium.features.GeoJsonTooltip(
-                    fields=[province_column],
-                    aliases=['Province:'],
-                    style=("background-color: white; color: #333333; font-family: arial; font-size: 12px; padding: 10px;") 
-                )
-            )
-            
-            # Create custom tooltips that include the case count
-            for feature in geojson.data['features']:
+            # IMPROVED: Enhanced click interaction with both province name and case count
+            # Process each feature to add interactive popups AND tooltips
+            for feature in gdf_json_dict['features']:
                 province_name = feature['properties'].get(province_column, '')
                 cases = province_to_cases.get(province_name, 'No data')
                 
-                # If we have data for this province, format it nicely
+                # Format case numbers nicely
                 if isinstance(cases, (int, float)):
                     cases_str = f"{int(cases):,}"
                 else:
                     cases_str = str(cases)
                 
-                # Create popup with both province name and case count
+                # Create rich HTML content for popup
                 popup_content = f"""
-                <div style="font-family: Arial; font-size: 12px; padding: 5px;">
-                    <strong>{province_name}</strong><br>
-                    New Cases: {cases_str}
+                <div style="font-family: Arial; width: 200px; padding: 10px;">
+                    <h4 style="margin: 0 0 10px 0; color: #2563EB;">{province_name}</h4>
+                    <table style="width: 100%; border-collapse: collapse;">
+                        <tr>
+                            <td style="padding: 5px 0; border-bottom: 1px solid #eee;"><strong>New Cases:</strong></td>
+                            <td style="padding: 5px 0; border-bottom: 1px solid #eee; text-align: right;">{cases_str}</td>
+                        </tr>
+                    </table>
+                    <div style="font-size: 10px; margin-top: 10px; color: #666;">
+                        Click anywhere on map to close
+                    </div>
                 </div>
                 """
                 
-                # Add the popup to the feature
-                folium.Popup(popup_content).add_to(
-                    folium.GeoJson(
-                        feature,
-                        style_function=lambda x: {'fillColor': 'transparent', 'color': 'transparent'}
-                    ).add_to(m)
-                )
-            
-            # Add the GeoJson layer to the map
-            geojson.add_to(m)
+                # Create tooltip content (simpler, shown on hover)
+                tooltip_content = f"{province_name}: {cases_str} cases"
+                
+                # Add GeoJson layer with both popup and tooltip for this feature
+                folium.GeoJson(
+                    {"type": "Feature", "geometry": feature["geometry"], "properties": feature["properties"]},
+                    style_function=lambda x: {
+                        'fillOpacity': 0.0,
+                        'weight': 0.5,
+                        'color': '#333'
+                    },
+                    tooltip=tooltip_content,
+                    popup=folium.Popup(popup_content, max_width=300)
+                ).add_to(m)
             
             # Add a title
             title_html = f"""
@@ -387,13 +383,22 @@ with col2:
             """
             m.get_root().html.add_child(folium.Element(title_html))
             
+            # Add instructions for users
+            instructions_html = f"""
+            <div style="position: fixed; bottom: 20px; left: 50px; width: 250px; 
+            background-color: rgba(255,255,255,0.8); border-radius: 5px; padding: 5px; 
+            font-size: 12px; text-align: center;">
+            Hover over a province to see cases, click for details</div>
+            """
+            m.get_root().html.add_child(folium.Element(instructions_html))
+            
             # Render map
             folium_static(m, width=700, height=500)
         except Exception as e:
             st.error(f"Error rendering map: {str(e)}")
             st.info("Trying simplified rendering method...")
             
-            # Create a very simple map as fallback
+            # Create a very simple map as fallback with improved click interaction
             try:
                 # Create base map
                 m = folium.Map(
@@ -413,22 +418,33 @@ with col2:
                     fill_color='YlOrRd'
                 ).add_to(m)
                 
-                # Add basic tooltips with both province and case count
+                # Add markers with popups for each province
                 province_to_cases = dict(zip(date_data['Location'], date_data['New Cases']))
                 
                 for location, cases in province_to_cases.items():
                     # Find matching feature
                     for feature in gdf.iterrows():
                         if feature[1][province_column] == location:
+                            # Format case numbers
+                            cases_str = f"{int(cases):,}" if isinstance(cases, (int, float)) else str(cases)
+                            
+                            # Create rich HTML content for popup
+                            popup_content = f"""
+                            <div style="font-family: Arial; padding: 5px;">
+                                <h4 style="margin: 2px 0;">{location}</h4>
+                                <strong>New Cases:</strong> {cases_str}
+                            </div>
+                            """
+                            
                             # Add a marker with popup showing both province and cases
                             folium.Marker(
                                 location=[feature[1].geometry.centroid.y, feature[1].geometry.centroid.x],
-                                popup=f"{location}: {int(cases):,} cases",
-                                tooltip=f"{location}: {int(cases):,} cases",
+                                popup=folium.Popup(popup_content, max_width=200),
+                                tooltip=f"{location}: {cases_str} cases",
                                 icon=folium.DivIcon(
                                     html=f"""
                                     <div style="font-size: 10px; background-color: white; border-radius: 3px; padding: 2px; border: 1px solid gray; white-space: nowrap;">
-                                        {int(cases):,}
+                                        {location}: {cases_str}
                                     </div>
                                     """
                                 )
