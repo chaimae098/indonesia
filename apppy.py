@@ -289,11 +289,13 @@ with col1:
 
 # Function to create map with caching - FIXED VERSION
 @st.cache_data(show_spinner=False)
-def create_covid_map(gdf_data, date_data_df, date_str, province_col):
-    """Create optimized choropleth map for the selected date"""
+def create_covid_map(_gdf_data, date_data_df, date_str, province_col):
+    """Create optimized choropleth map for the selected date
+    Note: _gdf_data has underscore prefix to prevent hashing of this parameter
+    """
     try:
         # Unpack the data - but keep as separate variables (hashable)
-        gdf, gdf_json_str = gdf_data
+        gdf, gdf_json_str = _gdf_data
         
         # Create base map with optimized parameters
         m = folium.Map(
@@ -370,30 +372,27 @@ with col2:
     # Only create map if there's data (and hide spinner for better UX)
     if not date_data.empty:
         try:
-            m = create_covid_map((gdf, gdf_json), date_data, selected_date_str, province_column)
-            if m:
-                # Render map
-                folium_static(m, width=700, height=500)
-            else:
-                st.error("Could not generate map.")
-        except Exception as e:
-            st.error(f"Error rendering map: {str(e)}")
-            st.info("Trying alternative rendering method...")
-            
-            # Fallback method if the cached function fails
+            # Disable caching temporarily if we're still having issues
+            # Create map directly without caching
             try:
-                # Create a simpler map directly
+                # Create base map with optimized parameters
                 m = folium.Map(
-                    location=[-2.5, 118],
+                    location=[-2.5, 118],  # Indonesia center
                     zoom_start=5,
-                    tiles="CartoDB positron"
+                    tiles="CartoDB positron",
+                    prefer_canvas=True
                 )
                 
-                # Convert GeoJSON string back to dict for folium
-                gdf_json_dict = folium.GeoJson(gdf_json).data
+                # Create GeoJSON from GDF for folium
+                if isinstance(gdf_json, str):
+                    # If it's a string, convert to dict
+                    gdf_json_dict = folium.GeoJson(gdf_json).data
+                else:
+                    # If it's already a dict-like object, use directly
+                    gdf_json_dict = gdf.__geo_interface__
                 
-                # Add a basic choropleth
-                folium.Choropleth(
+                # Add choropleth with optimized rendering
+                choropleth = folium.Choropleth(
                     geo_data=gdf_json_dict,
                     name="choropleth",
                     data=date_data,
@@ -402,13 +401,72 @@ with col2:
                     fill_color='YlOrRd',
                     fill_opacity=0.7,
                     line_opacity=0.2,
-                    legend_name=f"New COVID-19 Cases ({selected_date_str})"
+                    legend_name=f"New COVID-19 Cases ({selected_date_str})",
+                    highlight=True,
+                    smooth_factor=0.5
                 ).add_to(m)
                 
+                # Add tooltips
+                folium.GeoJson(
+                    gdf_json_dict,
+                    style_function=lambda x: {'fillColor': '#ffffff', 'color':'#000000', 'fillOpacity': 0.1, 'weight': 0.1},
+                    control=False,
+                    highlight_function=lambda x: {'fillColor': '#000000', 'color':'#000000', 'fillOpacity': 0.50, 'weight': 0.1},
+                    tooltip=folium.features.GeoJsonTooltip(
+                        fields=[province_column],
+                        aliases=['Province:'],
+                        style=("background-color: white; color: #333333; font-family: arial; font-size: 12px; padding: 10px;") 
+                    )
+                ).add_to(m)
+                
+                # Add a title
+                title_html = f"""
+                <div style="position: fixed; top: 10px; left: 50px; width: 250px; 
+                background-color: rgba(255,255,255,0.8); border-radius: 5px; padding: 5px; 
+                font-size: 14px; font-weight: bold; text-align: center;">
+                COVID-19 New Cases: {selected_date_str}</div>
+                """
+                m.get_root().html.add_child(folium.Element(title_html))
+                
+                # Render map
                 folium_static(m, width=700, height=500)
-            except Exception as e2:
-                st.error(f"Alternative method also failed: {str(e2)}")
-                st.info("Please check your data and shapefile formats")
+            except Exception as e1:
+                st.error(f"Primary method failed: {str(e1)}")
+                st.info("Trying simplified rendering method...")
+                
+                # Create a very simple map as fallback
+                m = folium.Map(
+                    location=[-2.5, 118],
+                    zoom_start=5
+                )
+                
+                # Add a simple choropleth with minimal options
+                # Try to convert GDF directly to avoid string conversion issues
+                try:
+                    simple_geojson = gdf.__geo_interface__
+                    
+                    folium.Choropleth(
+                        geo_data=simple_geojson,
+                        data=date_data,
+                        columns=['Location', 'New Cases'],
+                        key_on=f'feature.properties.{province_column}',
+                        fill_color='YlOrRd'
+                    ).add_to(m)
+                    
+                    folium_static(m, width=700, height=500)
+                except Exception as e2:
+                    st.error(f"Simplified method also failed: {str(e2)}")
+                    st.info("Displaying province data table only")
+                    
+                    # Show data table as last resort
+                    st.dataframe(
+                        date_data[['Location', 'New Cases']].sort_values('New Cases', ascending=False),
+                        use_container_width=True,
+                        hide_index=True
+                    )
+        except Exception as e:
+            st.error(f"Error rendering map: {str(e)}")
+            st.info("Please check your data and shapefile formats")
     else:
         st.warning(f"No data available for {selected_date_str}")
 
@@ -451,22 +509,58 @@ if provinces:
     # Filter data efficiently
     trend_df = covid_df[covid_df['Location'].isin(provinces)].copy()
     
-    # Downsample the data for better performance
-    if len(trend_df) > 500:  # Only downsample if needed
-        # Group by province and date to downsample properly
-        trend_df = trend_df.groupby(['Location', pd.Grouper(key='Date', freq='3D')], as_index=False).agg({
-            'New Cases': 'mean'
-        })
-    
-    # Create plot with Plotly - optimize for performance
-    fig = px.line(
-        trend_df, 
-        x='Date', 
-        y='New Cases', 
-        color='Location',
-        title="COVID-19 New Cases Trend",
-        labels={"Date": "Date", "New Cases": "New Cases", "Location": "Province"}
-    )
+    try:
+        # Downsample the data for better performance - safer approach
+        if len(trend_df) > 500:  # Only downsample if needed
+            # Use a safer resample approach - first reset index
+            trend_list = []
+            
+            # Process each province separately to avoid dimension mismatch
+            for province in provinces:
+                province_df = trend_df[trend_df['Location'] == province].copy()
+                
+                # Only process if we have data
+                if not province_df.empty:
+                    # Set Date as index for resampling
+                    province_df = province_df.set_index('Date')
+                    
+                    # Resample with 3-day frequency and take the mean
+                    resampled = province_df.resample('3D')['New Cases'].mean().reset_index()
+                    
+                    # Add location back
+                    resampled['Location'] = province
+                    
+                    # Add to our list
+                    trend_list.append(resampled)
+            
+            # Combine all provinces back together
+            if trend_list:
+                trend_df = pd.concat(trend_list)
+        
+        # Create plot with Plotly - optimize for performance
+        fig = px.line(
+            trend_df, 
+            x='Date', 
+            y='New Cases', 
+            color='Location',
+            title="COVID-19 New Cases Trend",
+            labels={"Date": "Date", "New Cases": "New Cases", "Location": "Province"}
+        )
+    except Exception as e:
+        st.error(f"Error processing trend data: {str(e)}")
+        # Create a simple plot with the original data as fallback
+        try:
+            fig = px.line(
+                trend_df, 
+                x='Date', 
+                y='New Cases', 
+                color='Location',
+                title="COVID-19 New Cases Trend (Raw Data)",
+                labels={"Date": "Date", "New Cases": "New Cases", "Location": "Province"}
+            )
+        except Exception as e2:
+            st.error(f"Could not create trend chart: {str(e2)}")
+            fig = None
     
     # Optimize plot layout
     fig.update_layout(
