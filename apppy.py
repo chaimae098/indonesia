@@ -2,16 +2,15 @@ import streamlit as st
 import pandas as pd
 import folium
 from streamlit_folium import folium_static
+import geopandas as gpd
 from datetime import datetime
 import plotly.express as px
 import os
-import json
 import time
 
 # --- CONFIG ---
 CSV_PATH = 'data/indonesia_data.csv'
 SHAPEFILE_DIR = 'data'
-CACHE_DIR = 'cache'
 
 # Set page configuration
 st.set_page_config(
@@ -20,6 +19,9 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+# Ensure directories exist
+os.makedirs(SHAPEFILE_DIR, exist_ok=True)
 
 # Apply custom CSS for better aesthetics
 st.markdown("""
@@ -39,126 +41,64 @@ st.markdown("""
     .stSlider > div > div > div {
         background-color: #EF4444;
     }
-    /* Improves the date slider appearance */
-    .stSlider [data-baseweb="slider"] {
-        height: 6px;
-    }
-    /* Card styling for map */
-    .map-container {
-        background-color: white;
-        border-radius: 10px;
-        padding: 20px;
-        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-    }
 </style>
 """, unsafe_allow_html=True)
-
-# Ensure directories exist
-os.makedirs(CACHE_DIR, exist_ok=True)
-os.makedirs(SHAPEFILE_DIR, exist_ok=True)
 
 # Title
 st.title("Indonesia COVID-19 New Cases Choropleth Map")
 
-# --- FAST DATA LOADING STRATEGY ---
+# --- OPTIMIZED DATA LOADING ---
 
 @st.cache_data(ttl=3600)
-def load_and_prepare_base_data(csv_path):
-    """
-    Load CSV data and pre-process into dates and basic statistics
-    """
+def load_data(csv_path):
+    """Load and preprocess COVID data"""
     start_time = time.time()
     
     try:
-        # Load CSV with direct date parsing
+        # Load CSV efficiently with proper data types
         df = pd.read_csv(csv_path, sep=';')
         
-        # Convert date strings to datetime objects if they're not already
+        # Convert date to datetime only if needed
         if not pd.api.types.is_datetime64_any_dtype(df['Date']):
             df['Date'] = pd.to_datetime(df['Date'])
             
+        # Convert cases to numeric and filter out national data
         df['New Cases'] = pd.to_numeric(df['New Cases'], errors='coerce')
         df = df[df['Location'] != 'Indonesia']  # drop country-wide aggregate
         
-        # Get unique dates in chronological order
+        # Pre-compute date strings for UI
         all_dates = sorted(df['Date'].unique())
         date_strings = [d.strftime('%Y-%m-%d') for d in all_dates]
         
-        # Pre-compute metrics for all dates
+        # Pre-compute basic statistics per date to avoid recomputation
         date_metrics = {}
         for date in all_dates:
             date_str = date.strftime('%Y-%m-%d')
             date_data = df[df['Date'] == date]
             
             if not date_data.empty:
-                total_cases = int(date_data['New Cases'].sum())
-                max_idx = date_data['New Cases'].idxmax() if not date_data['New Cases'].isna().all() else None
-                max_province = date_data.loc[max_idx, 'Location'] if max_idx is not None else "Unknown"
-                max_cases = int(date_data['New Cases'].max()) if max_idx is not None else 0
-                
                 date_metrics[date_str] = {
-                    'total_cases': total_cases,
-                    'max_province': max_province,
-                    'max_cases': max_cases
+                    'total_cases': int(date_data['New Cases'].sum()),
+                    'max_province': date_data.loc[date_data['New Cases'].idxmax(), 'Location'] if not date_data['New Cases'].isna().all() else "Unknown",
+                    'max_cases': int(date_data['New Cases'].max()) if not date_data['New Cases'].isna().all() else 0
                 }
         
-        # Pre-compute trend data for top provinces
-        province_totals = df.groupby('Location')['New Cases'].sum().nlargest(10)
-        top_provinces = province_totals.index.tolist()
+        return df, date_strings, date_metrics
         
-        # Calculate trend data for top provinces
-        trend_data = {}
-        for province in top_provinces:
-            province_data = df[df['Location'] == province].copy()
-            # If too many points, sample to improve performance
-            if len(province_data) > 50:
-                province_data = province_data.iloc[::len(province_data)//50 + 1]
-            trend_data[province] = {
-                'dates': [d.strftime('%Y-%m-%d') for d in province_data['Date']],
-                'values': province_data['New Cases'].fillna(0).tolist()
-            }
-        
-        st.write(f"Data loading took {time.time() - start_time:.2f} seconds")
-        return df, all_dates, date_strings, date_metrics, top_provinces, trend_data
     except Exception as e:
         st.error(f"Error loading data: {e}")
-        st.exception(e)
-        return None, [], [], {}, [], {}
+        return None, [], {}
 
 @st.cache_data(ttl=3600)
-def prepare_geojson():
-    """
-    Prepare simplified GeoJSON for mapping - using cached version when possible
-    """
-    # Create cache directory if it doesn't exist
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    
-    # Look for pre-processed GeoJSON first (much faster than shapefile)
-    geojson_path = f"{CACHE_DIR}/indonesia_simple.geojson"
-    
-    if os.path.exists(geojson_path):
-        try:
-            with open(geojson_path, 'r') as f:
-                geojson_data = json.load(f)
-                # Store available properties in session state
-                if 'features' in geojson_data and len(geojson_data['features']) > 0:
-                    sample_feature = geojson_data['features'][0]
-                    available_properties = list(sample_feature.get('properties', {}).keys())
-                    st.session_state['geojson_properties'] = available_properties
-                return geojson_data
-        except Exception as e:
-            st.warning(f"Could not load cached GeoJSON: {e}")
-    
-    # If no cached file, try to load from shapefile
+def load_shapefile(shapefile_dir):
+    """Load and preprocess the shapefile"""
     try:
-        import geopandas as gpd
-        
         # Try different possible shapefile paths
         shapefile_options = [
-            f"{SHAPEFILE_DIR}/IDN_Indonesia_1.shp",
-            f"{SHAPEFILE_DIR}/IDN_adm1.shp",
-            f"{SHAPEFILE_DIR}/indonesia.shp",
-            f"{SHAPEFILE_DIR}/IDN.shp"
+            f"{shapefile_dir}/IDN_Indonesia_1.shp",
+            f"{shapefile_dir}/IDN_adm1.shp",
+            f"{shapefile_dir}/indonesia.shp",
+            f"{shapefile_dir}/IDN.shp"
         ]
         
         shapefile_path = None
@@ -171,33 +111,37 @@ def prepare_geojson():
             st.error("Could not find any suitable shapefile")
             return None
             
-        # Load and simplify
-        shp = gpd.read_file(shapefile_path)
+        # Load shapefile directly
+        gdf = gpd.read_file(shapefile_path)
         
-        # Store shapefile columns in session state
-        st.session_state['shapefile_columns'] = list(shp.columns)
+        # Store shapefile columns in session state for debugging
+        st.session_state['shapefile_columns'] = list(gdf.columns)
         
-        # Simplify to reduce file size (tolerance controls simplification level)
-        shp_simple = shp.simplify(tolerance=0.01)
-        
-        # Convert to GeoJSON
-        geojson_data = json.loads(shp_simple.to_json())
-        
-        # Store available properties in session state
-        if 'features' in geojson_data and len(geojson_data['features']) > 0:
-            sample_feature = geojson_data['features'][0]
-            available_properties = list(sample_feature.get('properties', {}).keys())
-            st.session_state['geojson_properties'] = available_properties
-        
-        # Cache for future use
-        with open(geojson_path, 'w') as f:
-            json.dump(geojson_data, f)
+        # Optional: simplify geometries for faster rendering
+        if not gdf.empty:
+            gdf = gdf.copy()  # Make a copy to avoid SettingWithCopyWarning
             
-        return geojson_data
+        return gdf
     except Exception as e:
-        st.error(f"Could not process shapefile: {e}")
+        st.error(f"Error loading shapefile: {e}")
         st.exception(e)
         return None
+
+# Function to get data for a specific date (very fast)
+def get_date_data(raw_df, date_str):
+    """Get data for specific date with minimal processing"""
+    # Convert string to datetime if needed
+    if isinstance(date_str, str):
+        try:
+            date_obj = datetime.strptime(date_str, '%Y-%m-%d')
+        except ValueError:
+            # Try alternative format
+            date_obj = datetime.strptime(date_str, '%m/%d/%Y')
+    else:
+        date_obj = date_str
+        
+    date_data = raw_df[raw_df['Date'] == date_obj].copy()
+    return date_data
 
 # Load data with a spinner
 with st.spinner("Loading COVID-19 data..."):
@@ -251,18 +195,21 @@ with st.spinner("Loading COVID-19 data..."):
         
         st.stop()
         
-    raw_df, all_dates, date_strings, date_metrics, top_provinces, trend_data = load_and_prepare_base_data(CSV_PATH)
-    geojson_data = prepare_geojson()
+    covid_df, date_strings, date_metrics = load_data(CSV_PATH)
+    
+with st.spinner("Loading map data..."):
+    gdf = load_shapefile(SHAPEFILE_DIR)
 
-if raw_df is None or geojson_data is None:
+# Stop if data loading failed
+if covid_df is None or gdf is None:
     st.error("Failed to load required data. Please check your data files.")
     
     # Show more helpful error details
-    if raw_df is None:
+    if covid_df is None:
         st.info(f"The CSV file was found but could not be processed. Make sure it has the correct columns (Date, Location, New Cases) and separator (;).")
     
-    if geojson_data is None:
-        st.info(f"Could not load GeoJSON data. Make sure the shapefile exists in the {SHAPEFILE_DIR} directory.")
+    if gdf is None:
+        st.info(f"Could not load shapefile data. Make sure a shapefile exists in the {SHAPEFILE_DIR} directory.")
         
         # Check which shapefiles exist
         shapefile_options = [
@@ -280,354 +227,224 @@ if raw_df is None or geojson_data is None:
     
     st.stop()
 
-# Add debug section to display the GeoJSON structure
-with st.expander("Debug GeoJSON Structure", expanded=False):
-    if geojson_data and 'features' in geojson_data and len(geojson_data['features']) > 0:
-        sample_feature = geojson_data['features'][0]
-        st.write("First GeoJSON feature:")
-        st.json(sample_feature.get('properties', {}))
-        available_properties = list(sample_feature.get('properties', {}).keys())
-        st.write("Available properties:", available_properties)
-    else:
-        st.write("No GeoJSON features found or empty structure")
-
-# Ensure we have the geojson_properties in session state
-if 'geojson_properties' not in st.session_state and geojson_data:
-    # Inspect structure to identify available properties
-    if 'features' in geojson_data and len(geojson_data['features']) > 0:
-        sample_feature = geojson_data['features'][0]
-        available_properties = list(sample_feature.get('properties', {}).keys())
-        st.session_state['geojson_properties'] = available_properties
-
-# Function to get data for a specific date (very fast)
-def get_date_data(raw_df, date_str):
-    """Get data for specific date with minimal processing"""
-    # Convert string to datetime if needed
-    if isinstance(date_str, str):
-        try:
-            date_obj = datetime.strptime(date_str, '%Y-%m-%d')
-        except ValueError:
-            # Try alternative format
-            date_obj = datetime.strptime(date_str, '%m/%d/%Y')
-    else:
-        date_obj = date_str
-        
-    date_data = raw_df[raw_df['Date'] == date_obj].copy()
-    return date_data
-
 # Create two columns for layout
 col1, col2 = st.columns([1, 3])
 
 with col1:
     st.subheader("Date Selection")
     
+    # Date selector
     selected_date_str = st.select_slider(
         "Select date:",
         options=date_strings,
         value=date_strings[-1] if date_strings else None
     )
     
-    # Display pre-computed metrics
+    # Display metrics for selected date
     if selected_date_str in date_metrics:
         metrics = date_metrics[selected_date_str]
         st.metric("Total New Cases", f"{metrics['total_cases']:,}")
         st.metric("Highest Province", metrics['max_province'])
         st.metric("Cases in Highest", f"{metrics['max_cases']:,}")
     
-    # Add data table toggle
-    show_table = st.checkbox("Show data table", value=False)
+    # Province name column selection
+    province_cols = [col for col in gdf.columns if any(name in col.lower() for name in ['name', 'province', 'admin'])]
+    if province_cols:
+        default_col = next((col for col in ['NAME_1', 'NAME', 'PROVINCE'] if col in province_cols), province_cols[0])
+        province_column = st.selectbox(
+            "Select province name column:",
+            options=province_cols,
+            index=province_cols.index(default_col) if default_col in province_cols else 0
+        )
+    else:
+        province_column = 'NAME_1'  # Default if no good columns found
+        st.warning(f"No obvious province column found in shapefile. Using {province_column}")
     
-    # Add GeoJSON property selection
-    if 'geojson_properties' in st.session_state and st.session_state['geojson_properties']:
-        property_options = st.session_state['geojson_properties']
-        
-        # Try to find the best property key for provinces
-        default_property = None
-        priority_names = ['NAME_1', 'name', 'province', 'PROVINCE', 'name_1', 'NAME', 'ADMIN']
-        
-        for name in priority_names:
-            if name in property_options:
-                default_property = name
-                break
-                
-        if default_property is None and property_options:
-            default_property = property_options[0]
-            
-        selected_property = st.selectbox(
-            "Select GeoJSON property for provinces:",
-            options=property_options,
-            index=property_options.index(default_property) if default_property in property_options else 0
+    # Add options
+    show_table = st.checkbox("Show data table", value=False)
+
+# Function to create map for selected date
+def create_covid_map(gdf, date_data, date_str, province_column):
+    """Create choropleth map for the selected date"""
+    try:
+        # Create base map
+        m = folium.Map(
+            location=[-2.5, 118],  # Indonesia center
+            zoom_start=5,
+            tiles="CartoDB positron",
+            prefer_canvas=True  # For better performance
         )
         
-        # Store the selected property
-        st.session_state['selected_property'] = selected_property
-    else:
-        # Fallback to default property
-        st.session_state['selected_property'] = 'NAME_1'
-        st.warning("No GeoJSON properties found. Using default 'NAME_1'")
-
-# Create map function
-def make_fast_map(geojson_data, date_data):
-    """Create map with optimized processing"""
-    # Create province-data dictionary for this date
-    province_data = {}
-    
-    for _, row in date_data.iterrows():
-        province_data[row['Location']] = row['New Cases']
-    
-    # Create base map
-    m = folium.Map(
-        location=[-2.5, 118], 
-        zoom_start=5, 
-        tiles="CartoDB positron",
-        prefer_canvas=True  # Use Canvas renderer for better performance
-    )
-    
-    # Use the correct property key from session state
-    property_key = st.session_state.get('selected_property', 'NAME_1')
-    
-    # Make sure property_key is not None
-    if not property_key and 'geojson_properties' in st.session_state and st.session_state['geojson_properties']:
-        property_key = st.session_state['geojson_properties'][0]
-    
-    # Still fallback to a default if needed
-    if not property_key:
-        property_key = 'NAME_1'
-        
-    # This is the fixed part - we need to ensure the key_on correctly accesses properties
-    key_on = f'feature.properties.{property_key}'
-    
-    # Add choropleth
-    try:
-        # Debug message
-        st.write(f"Attempting to create choropleth with key: '{key_on}'")
-        
-        # Create a mapping between your data locations and GeoJSON features
-        province_mapping = {}
-        
-        # Show some debugging info
-        st.write("Checking province mapping...")
-        
-        # Extract all province names from the GeoJSON
-        geojson_provinces = []
-        for feature in geojson_data.get('features', []):
-            props = feature.get('properties', {})
-            if property_key in props:
-                geojson_provinces.append(props[property_key])
-        
-        st.write(f"GeoJSON provinces using '{property_key}': {geojson_provinces[:5]}...")
-        st.write(f"Data locations: {list(province_data.keys())[:5]}...")
-        
-        # Try to create choropleth
+        # Add choropleth - direct approach without conversion
         choropleth = folium.Choropleth(
-            geo_data=geojson_data,
+            geo_data=gdf.__geo_interface__,
             name="choropleth",
-            data=date_data,  # Use DataFrame instead of dictionary for more reliable matching
+            data=date_data,
             columns=['Location', 'New Cases'],
-            key_on=key_on,
+            key_on=f'feature.properties.{province_column}',
             fill_color='YlOrRd',
             fill_opacity=0.7,
             line_opacity=0.2,
-            legend_name=f"New COVID-19 Cases",
-            highlight=True,
-            smooth_factor=0.5,  # Smoother lines for better performance
-            line_color='#ffffff',
-            line_weight=0.5
+            legend_name=f"New COVID-19 Cases ({date_str})",
+            highlight=True
         ).add_to(m)
         
         # Add tooltips
+        style_function = lambda x: {'fillColor': '#ffffff', 
+                                    'color':'#000000', 
+                                    'fillOpacity': 0.1, 
+                                    'weight': 0.1}
+        highlight_function = lambda x: {'fillColor': '#000000', 
+                                        'color':'#000000', 
+                                        'fillOpacity': 0.50, 
+                                        'weight': 0.1}
+        
         folium.GeoJson(
-            geojson_data,
-            name='labels',
-            style_function=lambda x: {
-                'fillColor': 'transparent',
-                'color': 'transparent'
-            },
-            tooltip=folium.GeoJsonTooltip(
-                fields=[property_key],
+            gdf,
+            style_function=style_function,
+            control=False,
+            highlight_function=highlight_function,
+            tooltip=folium.features.GeoJsonTooltip(
+                fields=[province_column],
                 aliases=['Province:'],
-                style=("background-color: white; color: #333333; font-family: arial; font-size: 12px; padding: 10px;")
+                style=("background-color: white; color: #333333; font-family: arial; font-size: 12px; padding: 10px;") 
             )
         ).add_to(m)
         
+        # Add a title to the map
+        title_html = f"""
+        <div style="position: fixed; top: 10px; left: 50px; width: 250px; 
+        background-color: rgba(255,255,255,0.8); border-radius: 5px; padding: 5px; 
+        font-size: 14px; font-weight: bold; text-align: center;">
+        COVID-19 New Cases: {date_str}</div>
+        """
+        m.get_root().html.add_child(folium.Element(title_html))
+        
+        return m
     except Exception as e:
-        st.error(f"Error creating choropleth with property '{property_key}': {e}")
-        
-        # Show more detailed error
-        st.write("Error details:")
-        import traceback
-        st.code(traceback.format_exc())
-        
-        # Fallback to just displaying the base map with borders
-        st.write("Falling back to basic GeoJSON display")
-        folium.GeoJson(
-            geojson_data,
-            name='geojson',
-            style_function=lambda x: {
-                'fillColor': '#ffff00',
-                'color': '#000000',
-                'fillOpacity': 0.1,
-                'weight': 0.5
-            }
-        ).add_to(m)
-    
-    # Add title to map
-    title_html = '''
-    <div style="position: fixed; top: 10px; left: 50px; width: 250px; height: 30px; 
-    background-color: rgba(255,255,255,0.8); border-radius: 5px; 
-    font-size: 14px; font-weight: bold; text-align: center; 
-    line-height: 30px; padding: 5px; box-shadow: 0 0 5px rgba(0,0,0,0.2)">
-    COVID-19 New Cases: {}</div>
-    '''.format(selected_date_str)
-    m.get_root().html.add_child(folium.Element(title_html))
-    
-    return m
+        st.error(f"Error in map creation: {e}")
+        return None
 
 with col2:
-    # Create and display map with subheader
+    # Create and display map
     st.subheader(f"COVID-19 Map for {selected_date_str}")
-    
-    # Show property key info
-    if 'selected_property' in st.session_state:
-        st.caption(f"Using GeoJSON property: '{st.session_state['selected_property']}' to map provinces")
     
     try:
         # Get data for this date (fast)
-        date_data = get_date_data(raw_df, selected_date_str)
+        date_data = get_date_data(covid_df, selected_date_str)
         
         # Only create map if there's data
         if not date_data.empty:
             with st.spinner(f"Creating map for {selected_date_str}..."):
-                m = make_fast_map(geojson_data, date_data)
-                folium_static(m, width=800, height=500)
+                m = create_covid_map(gdf, date_data, selected_date_str, province_column)
+                if m:
+                    folium_static(m, width=700, height=500)
+                else:
+                    st.error("Could not generate map.")
         else:
             st.warning(f"No data available for {selected_date_str}")
     except Exception as e:
-        st.error(f"Error creating map: {e}")
+        st.error(f"Error displaying map: {e}")
         st.exception(e)
 
 # Display data table conditionally
-if show_table and raw_df is not None:
+if show_table and covid_df is not None:
     st.subheader("Data Table")
-    try:
-        # Get data for selected date
-        table_data = get_date_data(raw_df, selected_date_str)[['Location', 'New Cases']].copy()
-        table_data = table_data[table_data['New Cases'].notna()].sort_values('New Cases', ascending=False)
-        
-        # Display with formatting
-        st.dataframe(
-            table_data,
-            column_config={
-                "Location": st.column_config.TextColumn("Province"),
-                "New Cases": st.column_config.NumberColumn(
-                    "New Cases",
-                    format="%d"
-                )
-            },
-            use_container_width=True,
-            hide_index=True
-        )
-    except Exception as e:
-        st.error(f"Error displaying data table: {e}")
+    
+    # Get data for selected date
+    table_data = get_date_data(covid_df, selected_date_str)[['Location', 'New Cases']].copy()
+    table_data = table_data.sort_values('New Cases', ascending=False)
+    
+    # Display with formatting
+    st.dataframe(
+        table_data,
+        column_config={
+            "Location": st.column_config.TextColumn("Province"),
+            "New Cases": st.column_config.NumberColumn("New Cases", format="%d")
+        },
+        use_container_width=True,
+        hide_index=True
+    )
 
-# Add trend analysis section with pre-computed data
+# Add trend analysis section
 st.subheader("COVID-19 Trend Analysis")
 
-if trend_data:
-    # Create a simple trend chart for selected provinces
-    provinces = st.multiselect(
-        "Select provinces to compare:",
-        options=sorted(raw_df['Location'].unique()),
-        default=top_provinces[:3] if top_provinces else []
-    )
-    
-    if provinces:
-        # Create plot data from pre-computed and on-demand data
-        plot_data = []
-        
-        for province in provinces:
-            if province in trend_data:
-                # Use pre-computed data for top provinces (faster)
-                dates = [datetime.strptime(d, '%Y-%m-%d') for d in trend_data[province]['dates']]
-                values = trend_data[province]['values']
-                
-                for date, value in zip(dates, values):
-                    plot_data.append({
-                        'Date': date,
-                        'New Cases': value,
-                        'Location': province
-                    })
-            else:
-                # Calculate on-demand for other provinces (with sampling for performance)
-                province_data = raw_df[raw_df['Location'] == province].copy()
-                if len(province_data) > 50:  # Sample data for better performance
-                    province_data = province_data.iloc[::len(province_data)//50 + 1]
-                
-                for _, row in province_data.iterrows():
-                    plot_data.append({
-                        'Date': row['Date'],
-                        'New Cases': row['New Cases'],
-                        'Location': province
-                    })
-        
-        if plot_data:
-            # Convert to DataFrame
-            trend_df = pd.DataFrame(plot_data)
-            
-            fig = px.line(
-                trend_df, 
-                x='Date', 
-                y='New Cases', 
-                color='Location',
-                title="COVID-19 New Cases Trend",
-                labels={"Date": "Date", "New Cases": "New Cases", "Location": "Province"}
-            )
-            
-            fig.update_layout(
-                height=450,
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-                margin=dict(l=40, r=40, t=40, b=40)
-            )
-            
-            st.plotly_chart(fig, use_container_width=True)
+# Get top provinces by total cases
+@st.cache_data
+def get_top_provinces(df, n=5):
+    return df.groupby('Location')['New Cases'].sum().nlargest(n).index.tolist()
 
-# Add footer with information
+top_provinces = get_top_provinces(covid_df)
+
+# Province selector
+provinces = st.multiselect(
+    "Select provinces to compare:",
+    options=sorted(covid_df['Location'].unique()),
+    default=top_provinces[:3] if top_provinces else []
+)
+
+if provinces:
+    # Filter data for selected provinces and create trend plot
+    trend_data = []
+    
+    for province in provinces:
+        province_data = covid_df[covid_df['Location'] == province].copy()
+        
+        # Downsample if too many points (for performance)
+        if len(province_data) > 50:
+            province_data = province_data.iloc[::len(province_data)//50 + 1]
+            
+        trend_data.append(province_data)
+    
+    # Combine all province data
+    if trend_data:
+        trend_df = pd.concat(trend_data)
+        
+        # Create plot with Plotly
+        fig = px.line(
+            trend_df, 
+            x='Date', 
+            y='New Cases', 
+            color='Location',
+            title="COVID-19 New Cases Trend",
+            labels={"Date": "Date", "New Cases": "New Cases", "Location": "Province"}
+        )
+        
+        fig.update_layout(
+            height=450,
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            margin=dict(l=40, r=40, t=40, b=40)
+        )
+        
+        st.plotly_chart(fig, use_container_width=True)
+
+# Footer
 st.markdown("""
-<div style="text-align: center; margin-top: 30px; padding: 20px; color: #666;">
+<div style="text-align: center; margin-top: 30px; padding: 10px; color: #666;">
     <p>Data source: Indonesia Ministry of Health • Last updated: May 2025</p>
-    <p>Created with Streamlit and Folium</p>
 </div>
 """, unsafe_allow_html=True)
 
 # Add debug and performance section (hidden by default)
 with st.expander("Debug & Performance Information", expanded=False):
     st.subheader("Performance Metrics")
-    st.write("Total number of dates in dataset:", len(date_strings))
-    st.write("Total number of provinces:", raw_df['Location'].nunique())
-    st.write("Total data points:", len(raw_df))
+    st.write("Total number of dates:", len(date_strings))
+    st.write("Total number of provinces:", covid_df['Location'].nunique())
+    st.write("Total data points:", len(covid_df))
     
-    # Cache info - Fixed the AttributeError here
-    st.write("Cache Info:")
-    try:
-        # For newer Streamlit versions
-        cache_data_stats = st.cache_data.get_stats()
-        for key, val in cache_data_stats.items():
-            st.write(f"- {key}: {val}")
-    except (AttributeError, TypeError):
-        # Fallback for older Streamlit versions or if get_stats() isn't available
-        st.write("- Cache statistics not available in this Streamlit version")
-    
-    # Show GeoJSON Properties
-    if 'geojson_properties' in st.session_state:
-        st.write("Available GeoJSON Properties:")
-        st.write(st.session_state['geojson_properties'])
-    
-    # Show Shapefile Columns
+    # Show shapefile columns
     if 'shapefile_columns' in st.session_state:
         st.write("Shapefile Columns:")
         st.write(st.session_state['shapefile_columns'])
         
-    # Additional debug info
-    if st.checkbox("Show raw data sample"):
-        st.write("Raw data sample (first 5 rows):")
-        st.dataframe(raw_df.head())
+    # Helper function to safely display GeoDataFrame (without geometry issues)
+    def safe_display(df):
+        df_copy = df.copy()
+        if 'geometry' in df_copy.columns:
+            df_copy['geometry'] = df_copy['geometry'].astype(str)
+        return df_copy
+    
+    # Show sample of shapefile data
+    st.write("Sample of shapefile data:")
+    if gdf is not None:
+        st.write(safe_display(gdf.head()))
