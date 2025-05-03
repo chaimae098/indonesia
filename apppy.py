@@ -7,6 +7,7 @@ from datetime import datetime
 import plotly.express as px
 import os
 import time
+import numpy as np
 
 # --- CONFIG ---
 CSV_PATH = 'data/indonesia_data.csv'
@@ -20,12 +21,9 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Ensure directories exist
-os.makedirs(SHAPEFILE_DIR, exist_ok=True)
-
 # Apply custom CSS for better aesthetics
-st.markdown("""
-<style>
+with open("style.css", "w") as f:
+    f.write("""
     .main {
         background-color: #f5f7f9;
     }
@@ -41,46 +39,65 @@ st.markdown("""
     .stSlider > div > div > div {
         background-color: #EF4444;
     }
-</style>
-""", unsafe_allow_html=True)
+    """)
+    
+st.markdown(f'<style>{open("style.css").read()}</style>', unsafe_allow_html=True)
 
 # Title
 st.title("Indonesia COVID-19 New Cases Choropleth Map")
 
 # --- OPTIMIZED DATA LOADING ---
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=3600, show_spinner=False)
 def load_data(csv_path):
-    """Load and preprocess COVID data"""
-    start_time = time.time()
-    
+    """Load and preprocess COVID data with optimal performance"""
     try:
-        # Load CSV efficiently with proper data types
-        df = pd.read_csv(csv_path, sep=';')
+        # Specify dtypes for faster loading and less memory usage
+        dtypes = {
+            'Location': 'category',  # Use category for strings that repeat
+            'New Cases': 'float32'   # Use smaller numeric type
+        }
+        parse_dates = ['Date']
         
-        # Convert date to datetime only if needed
-        if not pd.api.types.is_datetime64_any_dtype(df['Date']):
-            df['Date'] = pd.to_datetime(df['Date'])
-            
-        # Convert cases to numeric and filter out national data
-        df['New Cases'] = pd.to_numeric(df['New Cases'], errors='coerce')
-        df = df[df['Location'] != 'Indonesia']  # drop country-wide aggregate
+        # Load CSV with optimized parameters
+        df = pd.read_csv(
+            csv_path, 
+            sep=';', 
+            dtype=dtypes,
+            parse_dates=parse_dates,
+            low_memory=True
+        )
         
-        # Pre-compute date strings for UI
-        all_dates = sorted(df['Date'].unique())
-        date_strings = [d.strftime('%Y-%m-%d') for d in all_dates]
+        # Drop national data and NaN cases in one operation
+        df = df[
+            (df['Location'] != 'Indonesia') & 
+            (~df['New Cases'].isna())
+        ]
         
-        # Pre-compute basic statistics per date to avoid recomputation
+        # Extract unique dates more efficiently
+        all_dates = pd.DatetimeIndex(df['Date'].unique()).sort_values()
+        date_strings = all_dates.strftime('%Y-%m-%d').tolist()
+        
+        # Pre-compute date metrics efficiently by date
+        date_data = df.groupby(['Date'])
+        
+        # Calculate metrics for each date in one go
+        max_cases_idx = date_data['New Cases'].idxmax()
+        sum_cases = date_data['New Cases'].sum()
+        
+        # Create metrics dictionary efficiently
         date_metrics = {}
         for date in all_dates:
             date_str = date.strftime('%Y-%m-%d')
-            date_data = df[df['Date'] == date]
+            date_df = df[df['Date'] == date]
             
-            if not date_data.empty:
+            if not date_df.empty:
+                max_idx = date_df['New Cases'].idxmax() if len(date_df) > 0 else None
+                
                 date_metrics[date_str] = {
-                    'total_cases': int(date_data['New Cases'].sum()),
-                    'max_province': date_data.loc[date_data['New Cases'].idxmax(), 'Location'] if not date_data['New Cases'].isna().all() else "Unknown",
-                    'max_cases': int(date_data['New Cases'].max()) if not date_data['New Cases'].isna().all() else 0
+                    'total_cases': int(date_df['New Cases'].sum()),
+                    'max_province': date_df.loc[max_idx, 'Location'] if max_idx is not None else "Unknown",
+                    'max_cases': int(date_df['New Cases'].max()) if max_idx is not None else 0
                 }
         
         return df, date_strings, date_metrics
@@ -89,9 +106,9 @@ def load_data(csv_path):
         st.error(f"Error loading data: {e}")
         return None, [], {}
 
-@st.cache_data(ttl=3600)
-def load_shapefile(shapefile_dir):
-    """Load and preprocess the shapefile"""
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_shapefile(shapefile_dir, simplify_tolerance=0.001):
+    """Load and preprocess the shapefile with simplification for faster rendering"""
     try:
         # Try different possible shapefile paths
         shapefile_options = [
@@ -111,26 +128,27 @@ def load_shapefile(shapefile_dir):
             st.error("Could not find any suitable shapefile")
             return None
             
-        # Load shapefile directly
-        gdf = gpd.read_file(shapefile_path)
+        # Load shapefile with optimized parameters
+        gdf = gpd.read_file(shapefile_path, driver='ESRI Shapefile')
         
-        # Store shapefile columns in session state for debugging
-        st.session_state['shapefile_columns'] = list(gdf.columns)
+        # Simplify geometries for MUCH faster rendering
+        gdf['geometry'] = gdf['geometry'].simplify(simplify_tolerance)
         
-        # Optional: simplify geometries for faster rendering
-        if not gdf.empty:
-            gdf = gdf.copy()  # Make a copy to avoid SettingWithCopyWarning
-            
-        return gdf
+        # Convert to lighter-weight geojson for faster processing
+        gdf_json = gdf.__geo_interface__
+        
+        # Store shapefile columns
+        shapefile_columns = list(gdf.columns)
+        
+        return gdf, gdf_json, shapefile_columns
     except Exception as e:
         st.error(f"Error loading shapefile: {e}")
-        st.exception(e)
-        return None
+        return None, None, []
 
-# Function to get data for a specific date (very fast)
-def get_date_data(raw_df, date_str):
+@st.cache_data(show_spinner=False)
+def get_date_data(date_str, data_df):
     """Get data for specific date with minimal processing"""
-    # Convert string to datetime if needed
+    # Convert string to datetime for filtering
     if isinstance(date_str, str):
         try:
             date_obj = datetime.strptime(date_str, '%Y-%m-%d')
@@ -139,82 +157,86 @@ def get_date_data(raw_df, date_str):
             date_obj = datetime.strptime(date_str, '%m/%d/%Y')
     else:
         date_obj = date_str
-        
-    date_data = raw_df[raw_df['Date'] == date_obj].copy()
+    
+    # Filter the data efficiently
+    mask = data_df['Date'] == date_obj
+    date_data = data_df.loc[mask].copy()
     return date_data
 
-# Load data with a spinner
-with st.spinner("Loading COVID-19 data..."):
-    # Check if data file exists first
-    if not os.path.exists(CSV_PATH):
-        st.error(f"Data file not found: {CSV_PATH}")
-        st.info("Please make sure your data is in the correct location. The app expects data in: data/indonesia_data.csv")
+@st.cache_data(show_spinner=False)
+def get_top_provinces(df, n=5):
+    """Calculate top provinces by total cases"""
+    return df.groupby('Location')['New Cases'].sum().nlargest(n).index.tolist()
+
+# Check if data files exist
+if not os.path.exists(CSV_PATH):
+    st.error(f"Data file not found: {CSV_PATH}")
+    st.info("Please make sure your data is in the correct location. The app expects data in: data/indonesia_data.csv")
+    
+    # Create sample data option
+    create_sample = st.button("Create sample data file for demonstration")
+    
+    if create_sample:
+        st.info("Creating sample data file...")
+        os.makedirs(os.path.dirname(CSV_PATH), exist_ok=True)
         
-        # Create a sample data file for demo purposes if it doesn't exist
-        try:
-            os.makedirs(os.path.dirname(CSV_PATH), exist_ok=True)
-            
-            # Check if we should create sample data
-            create_sample = st.button("Create sample data file for demonstration")
-            
-            if create_sample:
-                # Create minimal sample data
-                st.info("Creating sample data file...")
-                
-                # Generate sample data
-                import numpy as np
-                from datetime import datetime, timedelta
-                
-                # Create dates
-                base_date = datetime(2023, 1, 1)
-                dates = [base_date + timedelta(days=i) for i in range(30)]
-                
-                # Create provinces
-                provinces = ['Java', 'Sumatra', 'Sulawesi', 'Kalimantan', 'Papua']
-                
-                # Create DataFrame
-                rows = []
-                for date in dates:
-                    for province in provinces:
-                        # Random cases between 0 and 100
-                        cases = int(np.random.randint(0, 100))
-                        rows.append({
-                            'Date': date.strftime('%Y-%m-%d'),
-                            'Location': province,
-                            'New Cases': cases
-                        })
-                
-                sample_df = pd.DataFrame(rows)
-                
-                # Save to CSV
-                sample_df.to_csv(CSV_PATH, sep=';', index=False)
-                st.success(f"Sample data created at {CSV_PATH}")
-                st.info("Refresh the page to use the sample data")
-        except Exception as e:
-            st.error(f"Could not create sample data: {e}")
+        # Generate sample data efficiently
+        base_date = datetime(2023, 1, 1)
+        provinces = ['Java', 'Sumatra', 'Sulawesi', 'Kalimantan', 'Papua']
         
-        st.stop()
+        # Pre-allocate data arrays for better performance
+        dates_arr = []
+        loc_arr = []
+        cases_arr = []
         
+        for i in range(30):
+            for province in provinces:
+                dates_arr.append((base_date + pd.Timedelta(days=i)).strftime('%Y-%m-%d'))
+                loc_arr.append(province)
+                cases_arr.append(int(np.random.randint(0, 100)))
+        
+        # Create DataFrame from arrays (faster than appending rows)
+        sample_df = pd.DataFrame({
+            'Date': dates_arr,
+            'Location': loc_arr,
+            'New Cases': cases_arr
+        })
+        
+        # Save to CSV
+        sample_df.to_csv(CSV_PATH, sep=';', index=False)
+        st.success(f"Sample data created at {CSV_PATH}")
+        st.info("Refresh the page to use the sample data")
+    
+    st.stop()
+
+# Load data using progress indicator
+with st.spinner("Loading data..."):
+    # Use a combined progress bar for better UX
+    progress_bar = st.progress(0)
+    
+    # Load the data
+    progress_bar.progress(25)
     covid_df, date_strings, date_metrics = load_data(CSV_PATH)
     
-with st.spinner("Loading map data..."):
-    gdf = load_shapefile(SHAPEFILE_DIR)
+    progress_bar.progress(50)
+    gdf, gdf_json, shapefile_columns = load_shapefile(SHAPEFILE_DIR)
+    
+    progress_bar.progress(100)
+    progress_bar.empty()  # Remove progress bar when done
 
 # Stop if data loading failed
 if covid_df is None or gdf is None:
     st.error("Failed to load required data. Please check your data files.")
     
-    # Show more helpful error details
     if covid_df is None:
         st.info(f"The CSV file was found but could not be processed. Make sure it has the correct columns (Date, Location, New Cases) and separator (;).")
     
     if gdf is None:
         st.info(f"Could not load shapefile data. Make sure a shapefile exists in the {SHAPEFILE_DIR} directory.")
         
-        # Check which shapefiles exist
         shapefile_options = [
             f"{SHAPEFILE_DIR}/IDN_Indonesia_1.shp",
-            f"{SHAPEFILE_DIR}/IDN_adm1.shp",
+            f"{SHAPEFILE_DIR}/IDN_adm1.shp", 
             f"{SHAPEFILE_DIR}/indonesia.shp",
             f"{SHAPEFILE_DIR}/IDN.shp"
         ]
@@ -227,28 +249,31 @@ if covid_df is None or gdf is None:
     
     st.stop()
 
-# Create two columns for layout
+# Create layout with columns
 col1, col2 = st.columns([1, 3])
 
 with col1:
     st.subheader("Date Selection")
     
-    # Date selector
+    # Efficient date selector
     selected_date_str = st.select_slider(
         "Select date:",
         options=date_strings,
         value=date_strings[-1] if date_strings else None
     )
     
-    # Display metrics for selected date
+    # Display metrics for selected date efficiently
     if selected_date_str in date_metrics:
         metrics = date_metrics[selected_date_str]
-        st.metric("Total New Cases", f"{metrics['total_cases']:,}")
-        st.metric("Highest Province", metrics['max_province'])
-        st.metric("Cases in Highest", f"{metrics['max_cases']:,}")
+        
+        # Use a more efficient layout for metrics
+        cols = st.columns(3)
+        cols[0].metric("Total New Cases", f"{metrics['total_cases']:,}")
+        cols[1].metric("Highest Province", metrics['max_province'])
+        cols[2].metric("Cases in Highest", f"{metrics['max_cases']:,}")
     
     # Province name column selection
-    province_cols = [col for col in gdf.columns if any(name in col.lower() for name in ['name', 'province', 'admin'])]
+    province_cols = [col for col in shapefile_columns if any(name in col.lower() for name in ['name', 'province', 'admin'])]
     if province_cols:
         default_col = next((col for col in ['NAME_1', 'NAME', 'PROVINCE'] if col in province_cols), province_cols[0])
         province_column = st.selectbox(
@@ -260,24 +285,30 @@ with col1:
         province_column = 'NAME_1'  # Default if no good columns found
         st.warning(f"No obvious province column found in shapefile. Using {province_column}")
     
-    # Add options
+    # Add options - use checkbox with default state
     show_table = st.checkbox("Show data table", value=False)
 
-# Function to create map for selected date
-def create_covid_map(gdf, date_data, date_str, province_column):
-    """Create choropleth map for the selected date"""
+# Function to create map with caching
+@st.cache_data(show_spinner=False)
+def create_covid_map(gdf_data, date_data, date_str, province_column):
+    """Create optimized choropleth map for the selected date"""
     try:
-        # Create base map
+        # Use the simplified GeoDataFrame
+        gdf, gdf_json = gdf_data
+        
+        # Create base map with optimized parameters
         m = folium.Map(
             location=[-2.5, 118],  # Indonesia center
             zoom_start=5,
             tiles="CartoDB positron",
-            prefer_canvas=True  # For better performance
+            prefer_canvas=True,    # For better performance
+            disable_3d=True,       # Disable 3D rendering
+            zoom_control=False     # Simplify controls
         )
         
-        # Add choropleth - direct approach without conversion
+        # Add choropleth with optimized rendering
         choropleth = folium.Choropleth(
-            geo_data=gdf.__geo_interface__,
+            geo_data=gdf_json,
             name="choropleth",
             data=date_data,
             columns=['Location', 'New Cases'],
@@ -286,21 +317,23 @@ def create_covid_map(gdf, date_data, date_str, province_column):
             fill_opacity=0.7,
             line_opacity=0.2,
             legend_name=f"New COVID-19 Cases ({date_str})",
-            highlight=True
+            highlight=True,
+            smooth_factor=0.5   # Add smoothing for performance
         ).add_to(m)
         
-        # Add tooltips
+        # Add simplified tooltips
         style_function = lambda x: {'fillColor': '#ffffff', 
-                                    'color':'#000000', 
-                                    'fillOpacity': 0.1, 
-                                    'weight': 0.1}
+                                   'color':'#000000', 
+                                   'fillOpacity': 0.1, 
+                                   'weight': 0.1}
         highlight_function = lambda x: {'fillColor': '#000000', 
-                                        'color':'#000000', 
-                                        'fillOpacity': 0.50, 
-                                        'weight': 0.1}
+                                       'color':'#000000', 
+                                       'fillOpacity': 0.50, 
+                                       'weight': 0.1}
         
+        # Use the simplified GeoJSON for tooltips
         folium.GeoJson(
-            gdf,
+            gdf_json,
             style_function=style_function,
             control=False,
             highlight_function=highlight_function,
@@ -329,33 +362,31 @@ with col2:
     # Create and display map
     st.subheader(f"COVID-19 Map for {selected_date_str}")
     
-    try:
-        # Get data for this date (fast)
-        date_data = get_date_data(covid_df, selected_date_str)
-        
-        # Only create map if there's data
-        if not date_data.empty:
-            with st.spinner(f"Creating map for {selected_date_str}..."):
-                m = create_covid_map(gdf, date_data, selected_date_str, province_column)
-                if m:
-                    folium_static(m, width=700, height=500)
-                else:
-                    st.error("Could not generate map.")
+    # Get data for this date (fast with caching)
+    date_data = get_date_data(selected_date_str, covid_df)
+    
+    # Only create map if there's data (and hide spinner for better UX)
+    if not date_data.empty:
+        m = create_covid_map((gdf, gdf_json), date_data, selected_date_str, province_column)
+        if m:
+            # Render map
+            folium_static(m, width=700, height=500)
         else:
-            st.warning(f"No data available for {selected_date_str}")
-    except Exception as e:
-        st.error(f"Error displaying map: {e}")
-        st.exception(e)
+            st.error("Could not generate map.")
+    else:
+        st.warning(f"No data available for {selected_date_str}")
 
 # Display data table conditionally
 if show_table and covid_df is not None:
     st.subheader("Data Table")
     
-    # Get data for selected date
-    table_data = get_date_data(covid_df, selected_date_str)[['Location', 'New Cases']].copy()
+    # Get data for selected date - reuse cached data
+    table_data = date_data[['Location', 'New Cases']].copy()
+    
+    # Sort efficiently
     table_data = table_data.sort_values('New Cases', ascending=False)
     
-    # Display with formatting
+    # Display with optimized formatting
     st.dataframe(
         table_data,
         column_config={
@@ -369,11 +400,7 @@ if show_table and covid_df is not None:
 # Add trend analysis section
 st.subheader("COVID-19 Trend Analysis")
 
-# Get top provinces by total cases
-@st.cache_data
-def get_top_provinces(df, n=5):
-    return df.groupby('Location')['New Cases'].sum().nlargest(n).index.tolist()
-
+# Get top provinces using cached function
 top_provinces = get_top_provinces(covid_df)
 
 # Province selector
@@ -383,40 +410,43 @@ provinces = st.multiselect(
     default=top_provinces[:3] if top_provinces else []
 )
 
+# Only create plot if provinces are selected (improves performance)
 if provinces:
-    # Filter data for selected provinces and create trend plot
-    trend_data = []
+    # Filter data efficiently
+    trend_df = covid_df[covid_df['Location'].isin(provinces)].copy()
     
-    for province in provinces:
-        province_data = covid_df[covid_df['Location'] == province].copy()
-        
-        # Downsample if too many points (for performance)
-        if len(province_data) > 50:
-            province_data = province_data.iloc[::len(province_data)//50 + 1]
-            
-        trend_data.append(province_data)
+    # Downsample the data for better performance
+    if len(trend_df) > 500:  # Only downsample if needed
+        # Group by province and date to downsample properly
+        trend_df = trend_df.groupby(['Location', pd.Grouper(key='Date', freq='3D')], as_index=False).agg({
+            'New Cases': 'mean'
+        })
     
-    # Combine all province data
-    if trend_data:
-        trend_df = pd.concat(trend_data)
-        
-        # Create plot with Plotly
-        fig = px.line(
-            trend_df, 
-            x='Date', 
-            y='New Cases', 
-            color='Location',
-            title="COVID-19 New Cases Trend",
-            labels={"Date": "Date", "New Cases": "New Cases", "Location": "Province"}
+    # Create plot with Plotly - optimize for performance
+    fig = px.line(
+        trend_df, 
+        x='Date', 
+        y='New Cases', 
+        color='Location',
+        title="COVID-19 New Cases Trend",
+        labels={"Date": "Date", "New Cases": "New Cases", "Location": "Province"}
+    )
+    
+    # Optimize plot layout
+    fig.update_layout(
+        height=450,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        margin=dict(l=40, r=40, t=40, b=40),
+        hovermode='closest',  # Improve hover performance
+        # Reduce the number of date ticks for performance
+        xaxis=dict(
+            tickmode='auto',
+            nticks=10
         )
-        
-        fig.update_layout(
-            height=450,
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-            margin=dict(l=40, r=40, t=40, b=40)
-        )
-        
-        st.plotly_chart(fig, use_container_width=True)
+    )
+    
+    # Render chart
+    st.plotly_chart(fig, use_container_width=True)
 
 # Footer
 st.markdown("""
@@ -433,18 +463,5 @@ with st.expander("Debug & Performance Information", expanded=False):
     st.write("Total data points:", len(covid_df))
     
     # Show shapefile columns
-    if 'shapefile_columns' in st.session_state:
-        st.write("Shapefile Columns:")
-        st.write(st.session_state['shapefile_columns'])
-        
-    # Helper function to safely display GeoDataFrame (without geometry issues)
-    def safe_display(df):
-        df_copy = df.copy()
-        if 'geometry' in df_copy.columns:
-            df_copy['geometry'] = df_copy['geometry'].astype(str)
-        return df_copy
-    
-    # Show sample of shapefile data
-    st.write("Sample of shapefile data:")
-    if gdf is not None:
-        st.write(safe_display(gdf.head()))
+    st.write("Shapefile Columns:")
+    st.write(shapefile_columns)
