@@ -6,7 +6,6 @@ import geopandas as gpd
 from datetime import datetime
 import plotly.express as px
 import os
-import time
 import numpy as np
 
 # --- CONFIG ---
@@ -126,7 +125,7 @@ def load_shapefile(shapefile_dir, simplify_tolerance=0.001):
         
         if shapefile_path is None:
             st.error("Could not find any suitable shapefile")
-            return None
+            return None, None, []
             
         # Load shapefile with optimized parameters
         gdf = gpd.read_file(shapefile_path, driver='ESRI Shapefile')
@@ -134,11 +133,11 @@ def load_shapefile(shapefile_dir, simplify_tolerance=0.001):
         # Simplify geometries for MUCH faster rendering
         gdf['geometry'] = gdf['geometry'].simplify(simplify_tolerance)
         
-        # Convert to lighter-weight geojson for faster processing
-        gdf_json = gdf.__geo_interface__
-        
         # Store shapefile columns
         shapefile_columns = list(gdf.columns)
+        
+        # Convert to GeoJSON string representation (hashable) instead of dict
+        gdf_json = gdf.to_json()
         
         return gdf, gdf_json, shapefile_columns
     except Exception as e:
@@ -288,13 +287,13 @@ with col1:
     # Add options - use checkbox with default state
     show_table = st.checkbox("Show data table", value=False)
 
-# Function to create map with caching
+# Function to create map with caching - FIXED VERSION
 @st.cache_data(show_spinner=False)
-def create_covid_map(gdf_data, date_data, date_str, province_column):
+def create_covid_map(gdf_data, date_data_df, date_str, province_col):
     """Create optimized choropleth map for the selected date"""
     try:
-        # Use the simplified GeoDataFrame
-        gdf, gdf_json = gdf_data
+        # Unpack the data - but keep as separate variables (hashable)
+        gdf, gdf_json_str = gdf_data
         
         # Create base map with optimized parameters
         m = folium.Map(
@@ -306,13 +305,16 @@ def create_covid_map(gdf_data, date_data, date_str, province_column):
             zoom_control=False     # Simplify controls
         )
         
+        # Convert GeoJSON string back to dict for folium
+        gdf_json_dict = folium.GeoJson(gdf_json_str).data
+        
         # Add choropleth with optimized rendering
         choropleth = folium.Choropleth(
-            geo_data=gdf_json,
+            geo_data=gdf_json_dict,
             name="choropleth",
-            data=date_data,
+            data=date_data_df,
             columns=['Location', 'New Cases'],
-            key_on=f'feature.properties.{province_column}',
+            key_on=f'feature.properties.{province_col}',
             fill_color='YlOrRd',
             fill_opacity=0.7,
             line_opacity=0.2,
@@ -331,14 +333,14 @@ def create_covid_map(gdf_data, date_data, date_str, province_column):
                                        'fillOpacity': 0.50, 
                                        'weight': 0.1}
         
-        # Use the simplified GeoJSON for tooltips
+        # Use the GeoJSON dict for tooltips
         folium.GeoJson(
-            gdf_json,
+            gdf_json_dict,
             style_function=style_function,
             control=False,
             highlight_function=highlight_function,
             tooltip=folium.features.GeoJsonTooltip(
-                fields=[province_column],
+                fields=[province_col],
                 aliases=['Province:'],
                 style=("background-color: white; color: #333333; font-family: arial; font-size: 12px; padding: 10px;") 
             )
@@ -355,7 +357,7 @@ def create_covid_map(gdf_data, date_data, date_str, province_column):
         
         return m
     except Exception as e:
-        st.error(f"Error in map creation: {e}")
+        st.error(f"Error in map creation: {str(e)}")
         return None
 
 with col2:
@@ -367,12 +369,46 @@ with col2:
     
     # Only create map if there's data (and hide spinner for better UX)
     if not date_data.empty:
-        m = create_covid_map((gdf, gdf_json), date_data, selected_date_str, province_column)
-        if m:
-            # Render map
-            folium_static(m, width=700, height=500)
-        else:
-            st.error("Could not generate map.")
+        try:
+            m = create_covid_map((gdf, gdf_json), date_data, selected_date_str, province_column)
+            if m:
+                # Render map
+                folium_static(m, width=700, height=500)
+            else:
+                st.error("Could not generate map.")
+        except Exception as e:
+            st.error(f"Error rendering map: {str(e)}")
+            st.info("Trying alternative rendering method...")
+            
+            # Fallback method if the cached function fails
+            try:
+                # Create a simpler map directly
+                m = folium.Map(
+                    location=[-2.5, 118],
+                    zoom_start=5,
+                    tiles="CartoDB positron"
+                )
+                
+                # Convert GeoJSON string back to dict for folium
+                gdf_json_dict = folium.GeoJson(gdf_json).data
+                
+                # Add a basic choropleth
+                folium.Choropleth(
+                    geo_data=gdf_json_dict,
+                    name="choropleth",
+                    data=date_data,
+                    columns=['Location', 'New Cases'],
+                    key_on=f'feature.properties.{province_column}',
+                    fill_color='YlOrRd',
+                    fill_opacity=0.7,
+                    line_opacity=0.2,
+                    legend_name=f"New COVID-19 Cases ({selected_date_str})"
+                ).add_to(m)
+                
+                folium_static(m, width=700, height=500)
+            except Exception as e2:
+                st.error(f"Alternative method also failed: {str(e2)}")
+                st.info("Please check your data and shapefile formats")
     else:
         st.warning(f"No data available for {selected_date_str}")
 
@@ -465,3 +501,16 @@ with st.expander("Debug & Performance Information", expanded=False):
     # Show shapefile columns
     st.write("Shapefile Columns:")
     st.write(shapefile_columns)
+    
+    # Add error handling debugging section
+    st.subheader("Error Handling")
+    st.write("1. If the map doesn't load, check:")
+    st.write("   - The shapefile has a column named similar to NAME_1 or PROVINCE")
+    st.write("   - The province names in your CSV match those in the shapefile")
+    st.write("2. If trend analysis doesn't display:")
+    st.write("   - Ensure you have data for multiple dates for each province")
+    
+    # Render a sample of the data for debugging
+    st.subheader("Data Sample")
+    if covid_df is not None:
+        st.write(covid_df.head())
