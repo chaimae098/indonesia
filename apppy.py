@@ -280,6 +280,17 @@ if raw_df is None or geojson_data is None:
     
     st.stop()
 
+# Add debug section to display the GeoJSON structure
+with st.expander("Debug GeoJSON Structure", expanded=False):
+    if geojson_data and 'features' in geojson_data and len(geojson_data['features']) > 0:
+        sample_feature = geojson_data['features'][0]
+        st.write("First GeoJSON feature:")
+        st.json(sample_feature.get('properties', {}))
+        available_properties = list(sample_feature.get('properties', {}).keys())
+        st.write("Available properties:", available_properties)
+    else:
+        st.write("No GeoJSON features found or empty structure")
+
 # Ensure we have the geojson_properties in session state
 if 'geojson_properties' not in st.session_state and geojson_data:
     # Inspect structure to identify available properties
@@ -353,6 +364,7 @@ with col1:
     else:
         # Fallback to default property
         st.session_state['selected_property'] = 'NAME_1'
+        st.warning("No GeoJSON properties found. Using default 'NAME_1'")
 
 # Create map function
 def make_fast_map(geojson_data, date_data):
@@ -382,15 +394,36 @@ def make_fast_map(geojson_data, date_data):
     if not property_key:
         property_key = 'NAME_1'
         
+    # This is the fixed part - we need to ensure the key_on correctly accesses properties
     key_on = f'feature.properties.{property_key}'
     
     # Add choropleth
     try:
+        # Debug message
+        st.write(f"Attempting to create choropleth with key: '{key_on}'")
+        
+        # Create a mapping between your data locations and GeoJSON features
+        province_mapping = {}
+        
+        # Show some debugging info
+        st.write("Checking province mapping...")
+        
+        # Extract all province names from the GeoJSON
+        geojson_provinces = []
+        for feature in geojson_data.get('features', []):
+            props = feature.get('properties', {})
+            if property_key in props:
+                geojson_provinces.append(props[property_key])
+        
+        st.write(f"GeoJSON provinces using '{property_key}': {geojson_provinces[:5]}...")
+        st.write(f"Data locations: {list(province_data.keys())[:5]}...")
+        
+        # Try to create choropleth
         choropleth = folium.Choropleth(
             geo_data=geojson_data,
             name="choropleth",
-            data=province_data,
-            columns=["Province", "Value"],  # Not actually used with data_dict
+            data=date_data,  # Use DataFrame instead of dictionary for more reliable matching
+            columns=['Location', 'New Cases'],
             key_on=key_on,
             fill_color='YlOrRd',
             fill_opacity=0.7,
@@ -399,8 +432,7 @@ def make_fast_map(geojson_data, date_data):
             highlight=True,
             smooth_factor=0.5,  # Smoother lines for better performance
             line_color='#ffffff',
-            line_weight=0.5,
-            data_dict=province_data  # Direct data dictionary is much faster
+            line_weight=0.5
         ).add_to(m)
         
         # Add tooltips
@@ -421,7 +453,13 @@ def make_fast_map(geojson_data, date_data):
     except Exception as e:
         st.error(f"Error creating choropleth with property '{property_key}': {e}")
         
+        # Show more detailed error
+        st.write("Error details:")
+        import traceback
+        st.code(traceback.format_exc())
+        
         # Fallback to just displaying the base map with borders
+        st.write("Falling back to basic GeoJSON display")
         folium.GeoJson(
             geojson_data,
             name='geojson',
