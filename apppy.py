@@ -287,81 +287,6 @@ with col1:
     # Add options - use checkbox with default state
     show_table = st.checkbox("Show data table", value=False)
 
-# Function to create map with caching - FIXED VERSION
-@st.cache_data(show_spinner=False)
-def create_covid_map(_gdf_data, date_data_df, date_str, province_col):
-    """Create optimized choropleth map for the selected date
-    Note: _gdf_data has underscore prefix to prevent hashing of this parameter
-    """
-    try:
-        # Unpack the data - but keep as separate variables (hashable)
-        gdf, gdf_json_str = _gdf_data
-        
-        # Create base map with optimized parameters
-        m = folium.Map(
-            location=[-2.5, 118],  # Indonesia center
-            zoom_start=5,
-            tiles="CartoDB positron",
-            prefer_canvas=True,    # For better performance
-            disable_3d=True,       # Disable 3D rendering
-            zoom_control=False     # Simplify controls
-        )
-        
-        # Convert GeoJSON string back to dict for folium
-        gdf_json_dict = folium.GeoJson(gdf_json_str).data
-        
-        # Add choropleth with optimized rendering
-        choropleth = folium.Choropleth(
-            geo_data=gdf_json_dict,
-            name="choropleth",
-            data=date_data_df,
-            columns=['Location', 'New Cases'],
-            key_on=f'feature.properties.{province_col}',
-            fill_color='YlOrRd',
-            fill_opacity=0.7,
-            line_opacity=0.2,
-            legend_name=f"New COVID-19 Cases ({date_str})",
-            highlight=True,
-            smooth_factor=0.5   # Add smoothing for performance
-        ).add_to(m)
-        
-        # Add simplified tooltips
-        style_function = lambda x: {'fillColor': '#ffffff', 
-                                   'color':'#000000', 
-                                   'fillOpacity': 0.1, 
-                                   'weight': 0.1}
-        highlight_function = lambda x: {'fillColor': '#000000', 
-                                       'color':'#000000', 
-                                       'fillOpacity': 0.50, 
-                                       'weight': 0.1}
-        
-        # Use the GeoJSON dict for tooltips
-        folium.GeoJson(
-            gdf_json_dict,
-            style_function=style_function,
-            control=False,
-            highlight_function=highlight_function,
-            tooltip=folium.features.GeoJsonTooltip(
-                fields=[province_col],
-                aliases=['Province:'],
-                style=("background-color: white; color: #333333; font-family: arial; font-size: 12px; padding: 10px;") 
-            )
-        ).add_to(m)
-        
-        # Add a title to the map
-        title_html = f"""
-        <div style="position: fixed; top: 10px; left: 50px; width: 250px; 
-        background-color: rgba(255,255,255,0.8); border-radius: 5px; padding: 5px; 
-        font-size: 14px; font-weight: bold; text-align: center;">
-        COVID-19 New Cases: {date_str}</div>
-        """
-        m.get_root().html.add_child(folium.Element(title_html))
-        
-        return m
-    except Exception as e:
-        st.error(f"Error in map creation: {str(e)}")
-        return None
-
 with col2:
     # Create and display map
     st.subheader(f"COVID-19 Map for {selected_date_str}")
@@ -372,101 +297,153 @@ with col2:
     # Only create map if there's data (and hide spinner for better UX)
     if not date_data.empty:
         try:
-            # Disable caching temporarily if we're still having issues
-            # Create map directly without caching
-            try:
-                # Create base map with optimized parameters
-                m = folium.Map(
-                    location=[-2.5, 118],  # Indonesia center
-                    zoom_start=5,
-                    tiles="CartoDB positron",
-                    prefer_canvas=True
+            # Create base map with optimized parameters
+            m = folium.Map(
+                location=[-2.5, 118],  # Indonesia center
+                zoom_start=5,
+                tiles="CartoDB positron",
+                prefer_canvas=True
+            )
+            
+            # Create GeoJSON from GDF for folium
+            if isinstance(gdf_json, str):
+                # If it's a string, convert to dict
+                gdf_json_dict = folium.GeoJson(gdf_json).data
+            else:
+                # If it's already a dict-like object, use directly
+                gdf_json_dict = gdf.__geo_interface__
+            
+            # Add choropleth with optimized rendering
+            choropleth = folium.Choropleth(
+                geo_data=gdf_json_dict,
+                name="choropleth",
+                data=date_data,
+                columns=['Location', 'New Cases'],
+                key_on=f'feature.properties.{province_column}',
+                fill_color='YlOrRd',
+                fill_opacity=0.7,
+                line_opacity=0.2,
+                legend_name=f"New COVID-19 Cases ({selected_date_str})",
+                highlight=True,
+                smooth_factor=0.5
+            ).add_to(m)
+            
+            # Create a dictionary to map province names to case counts for tooltips
+            province_to_cases = dict(zip(date_data['Location'], date_data['New Cases']))
+            
+            # Create a function to get cases by province name
+            def get_cases(province_name):
+                return province_to_cases.get(province_name, 'No data')
+            
+            # Add tooltips with province name AND case count
+            geojson = folium.GeoJson(
+                gdf_json_dict,
+                style_function=lambda x: {'fillColor': '#ffffff', 'color':'#000000', 'fillOpacity': 0.1, 'weight': 0.1},
+                control=False,
+                highlight_function=lambda x: {'fillColor': '#000000', 'color':'#000000', 'fillOpacity': 0.50, 'weight': 0.1},
+                tooltip=folium.features.GeoJsonTooltip(
+                    fields=[province_column],
+                    aliases=['Province:'],
+                    style=("background-color: white; color: #333333; font-family: arial; font-size: 12px; padding: 10px;") 
                 )
+            )
+            
+            # Create custom tooltips that include the case count
+            for feature in geojson.data['features']:
+                province_name = feature['properties'].get(province_column, '')
+                cases = province_to_cases.get(province_name, 'No data')
                 
-                # Create GeoJSON from GDF for folium
-                if isinstance(gdf_json, str):
-                    # If it's a string, convert to dict
-                    gdf_json_dict = folium.GeoJson(gdf_json).data
+                # If we have data for this province, format it nicely
+                if isinstance(cases, (int, float)):
+                    cases_str = f"{int(cases):,}"
                 else:
-                    # If it's already a dict-like object, use directly
-                    gdf_json_dict = gdf.__geo_interface__
+                    cases_str = str(cases)
                 
-                # Add choropleth with optimized rendering
-                choropleth = folium.Choropleth(
-                    geo_data=gdf_json_dict,
-                    name="choropleth",
-                    data=date_data,
-                    columns=['Location', 'New Cases'],
-                    key_on=f'feature.properties.{province_column}',
-                    fill_color='YlOrRd',
-                    fill_opacity=0.7,
-                    line_opacity=0.2,
-                    legend_name=f"New COVID-19 Cases ({selected_date_str})",
-                    highlight=True,
-                    smooth_factor=0.5
-                ).add_to(m)
-                
-                # Add tooltips
-                folium.GeoJson(
-                    gdf_json_dict,
-                    style_function=lambda x: {'fillColor': '#ffffff', 'color':'#000000', 'fillOpacity': 0.1, 'weight': 0.1},
-                    control=False,
-                    highlight_function=lambda x: {'fillColor': '#000000', 'color':'#000000', 'fillOpacity': 0.50, 'weight': 0.1},
-                    tooltip=folium.features.GeoJsonTooltip(
-                        fields=[province_column],
-                        aliases=['Province:'],
-                        style=("background-color: white; color: #333333; font-family: arial; font-size: 12px; padding: 10px;") 
-                    )
-                ).add_to(m)
-                
-                # Add a title
-                title_html = f"""
-                <div style="position: fixed; top: 10px; left: 50px; width: 250px; 
-                background-color: rgba(255,255,255,0.8); border-radius: 5px; padding: 5px; 
-                font-size: 14px; font-weight: bold; text-align: center;">
-                COVID-19 New Cases: {selected_date_str}</div>
+                # Create popup with both province name and case count
+                popup_content = f"""
+                <div style="font-family: Arial; font-size: 12px; padding: 5px;">
+                    <strong>{province_name}</strong><br>
+                    New Cases: {cases_str}
+                </div>
                 """
-                m.get_root().html.add_child(folium.Element(title_html))
                 
-                # Render map
-                folium_static(m, width=700, height=500)
-            except Exception as e1:
-                st.error(f"Primary method failed: {str(e1)}")
-                st.info("Trying simplified rendering method...")
-                
-                # Create a very simple map as fallback
+                # Add the popup to the feature
+                folium.Popup(popup_content).add_to(
+                    folium.GeoJson(
+                        feature,
+                        style_function=lambda x: {'fillColor': 'transparent', 'color': 'transparent'}
+                    ).add_to(m)
+                )
+            
+            # Add the GeoJson layer to the map
+            geojson.add_to(m)
+            
+            # Add a title
+            title_html = f"""
+            <div style="position: fixed; top: 10px; left: 50px; width: 250px; 
+            background-color: rgba(255,255,255,0.8); border-radius: 5px; padding: 5px; 
+            font-size: 14px; font-weight: bold; text-align: center;">
+            COVID-19 New Cases: {selected_date_str}</div>
+            """
+            m.get_root().html.add_child(folium.Element(title_html))
+            
+            # Render map
+            folium_static(m, width=700, height=500)
+        except Exception as e:
+            st.error(f"Error rendering map: {str(e)}")
+            st.info("Trying simplified rendering method...")
+            
+            # Create a very simple map as fallback
+            try:
+                # Create base map
                 m = folium.Map(
                     location=[-2.5, 118],
                     zoom_start=5
                 )
                 
-                # Add a simple choropleth with minimal options
                 # Try to convert GDF directly to avoid string conversion issues
-                try:
-                    simple_geojson = gdf.__geo_interface__
-                    
-                    folium.Choropleth(
-                        geo_data=simple_geojson,
-                        data=date_data,
-                        columns=['Location', 'New Cases'],
-                        key_on=f'feature.properties.{province_column}',
-                        fill_color='YlOrRd'
-                    ).add_to(m)
-                    
-                    folium_static(m, width=700, height=500)
-                except Exception as e2:
-                    st.error(f"Simplified method also failed: {str(e2)}")
-                    st.info("Displaying province data table only")
-                    
-                    # Show data table as last resort
-                    st.dataframe(
-                        date_data[['Location', 'New Cases']].sort_values('New Cases', ascending=False),
-                        use_container_width=True,
-                        hide_index=True
-                    )
-        except Exception as e:
-            st.error(f"Error rendering map: {str(e)}")
-            st.info("Please check your data and shapefile formats")
+                simple_geojson = gdf.__geo_interface__
+                
+                # Create choropleth
+                choropleth = folium.Choropleth(
+                    geo_data=simple_geojson,
+                    data=date_data,
+                    columns=['Location', 'New Cases'],
+                    key_on=f'feature.properties.{province_column}',
+                    fill_color='YlOrRd'
+                ).add_to(m)
+                
+                # Add basic tooltips with both province and case count
+                province_to_cases = dict(zip(date_data['Location'], date_data['New Cases']))
+                
+                for location, cases in province_to_cases.items():
+                    # Find matching feature
+                    for feature in gdf.iterrows():
+                        if feature[1][province_column] == location:
+                            # Add a marker with popup showing both province and cases
+                            folium.Marker(
+                                location=[feature[1].geometry.centroid.y, feature[1].geometry.centroid.x],
+                                popup=f"{location}: {int(cases):,} cases",
+                                icon=folium.DivIcon(
+                                    html=f"""
+                                    <div style="font-size: 10px; white-space: nowrap;">
+                                        {int(cases):,}
+                                    </div>
+                                    """
+                                )
+                            ).add_to(m)
+                
+                folium_static(m, width=700, height=500)
+            except Exception as e2:
+                st.error(f"Simplified method also failed: {str(e2)}")
+                st.info("Displaying province data table only")
+                
+                # Show data table as last resort
+                st.dataframe(
+                    date_data[['Location', 'New Cases']].sort_values('New Cases', ascending=False),
+                    use_container_width=True,
+                    hide_index=True
+                )
     else:
         st.warning(f"No data available for {selected_date_str}")
 
