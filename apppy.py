@@ -579,6 +579,13 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
+# Add author footer with your name
+st.markdown("""
+<div style="text-align: center; margin-top: 10px; padding: 10px; background-color: #f0f2f6; border-radius: 5px;">
+    <p style="font-weight: bold; color: #1E3A8A;">Developed by: Kazoury Chaimae</p>
+</div>
+""", unsafe_allow_html=True)
+
 # Add debug and performance section (hidden by default)
 with st.expander("Debug & Performance Information", expanded=False):
     st.subheader("Performance Metrics")
