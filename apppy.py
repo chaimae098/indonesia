@@ -7,6 +7,8 @@ from datetime import datetime
 import plotly.express as px
 import os
 import numpy as np
+import threading
+import time
 
 # --- CONFIG ---
 CSV_PATH = 'data/indonesia_data.csv'
